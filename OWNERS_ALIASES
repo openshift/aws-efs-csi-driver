@@ -1,7 +1,7 @@
 aliases:
   openshift-storage-maintainers:
-    - jsafrane
-    - tsmetana
-    - gnufied
     - bertinatto
     - dobsonj
+    - gnufied
+    - jsafrane
+    - tsmetana
