@@ -117,7 +117,7 @@ replace (
 	k8s.io/kubelet => k8s.io/kubelet v0.22.3
 	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.22.3
 	k8s.io/metrics => k8s.io/metrics v0.22.3
-	k8s.io/mount-utils => k8s.io/mount-utils v0.22.4-rc.0
+	k8s.io/mount-utils => k8s.io/mount-utils v0.23.0
 	k8s.io/node-api => k8s.io/node-api v0.18.10
 	k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.22.3
 	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.22.3
