@@ -4,7 +4,7 @@ COPY . .
 RUN make bin/aws-efs-csi-driver
 
 # Use a base image with aws-efs-utils installed
-FROM registry.ci.openshift.org/ocp/4.14:aws-efs-utils-base
+FROM  registry.ci.openshift.org/ocp/4.14:aws-efs-utils-base
 
 # From the upstream Dockerfile:
 # At image build time, static files installed by efs-utils in the config directory, i.e. CAs file, need
