@@ -1,4 +1,4 @@
 approvers:
 - openshift-storage-maintainers
-component: "Storage"
+component: "Storage / Kubernetes External Components"
 
