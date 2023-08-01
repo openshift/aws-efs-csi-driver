@@ -32,7 +32,7 @@ const etcAmazonEfs = "/etc/amazon/efs"
 func main() {
 	var (
 		endpoint                 = flag.String("endpoint", "unix://tmp/csi.sock", "CSI Endpoint")
-		version                  = flag.Bool("version", false, "Print the version and exit")
+		version                  = flag.Bool("version", true, "Print the version and exit. Test cluster-bot")
 		efsUtilsCfgDirPath       = flag.String("efs-utils-config-dir-path", "/var/amazon/efs", "The preferred path for the efs-utils config directory. efs-utils-config-legacy-dir-path will be used if it is not empty, otherwise efs-utils-config-dir-path will be used.")
 		efsUtilsCfgLegacyDirPath = flag.String("efs-utils-config-legacy-dir-path", "/etc/amazon/efs-legacy", "The path to the legacy efs-utils config directory mounted from the host path /etc/amazon/efs")
 		efsUtilsStaticFilesPath  = flag.String("efs-utils-static-files-path", "/etc/amazon/efs-static-files/", "The path to efs-utils static files directory")
