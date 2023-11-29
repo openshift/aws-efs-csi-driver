@@ -31,10 +31,10 @@ def execute(command, file, shell=False):
 
 
 with open(results_dir_path + "/driver_info", "w") as f:
-    describe_driver_pod = f"kubectl describe po {driver_pod_name} -n kube-system"
+    describe_driver_pod = f"kubectl describe pod {driver_pod_name} -n kube-system"
     execute(command=describe_driver_pod, file=f)
 
-    get_driver_pod = f"kubectl get po {driver_pod_name} -n kube-system -o yaml"
+    get_driver_pod = f"kubectl get pod {driver_pod_name} -n kube-system -o yaml"
     execute(command=get_driver_pod, file=f)
 
 with open(results_dir_path + "/driver_logs", "w") as f:
@@ -45,7 +45,7 @@ with open(results_dir_path + "/driver_logs", "w") as f:
 def collect_driver_files_under_dir(dir_name, file):
     collect_driver_files_under_dir = (
         f"kubectl exec {driver_pod_name} -n kube-system -c efs-plugin -- find {dir_name} "
-        + r"-type f -exec echo {} \; -exec cat {} \; -exec echo \;"
+        + r"-type f -exec ls {} \; -exec cat {} \;"
     )
     execute(command=collect_driver_files_under_dir, file=file)
 

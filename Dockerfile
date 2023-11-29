@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM public.ecr.aws/eks-distro-build-tooling/golang:1.17 as go-builder
+FROM public.ecr.aws/eks-distro-build-tooling/golang:1.20 as go-builder
 WORKDIR /go/src/github.com/kubernetes-sigs/aws-efs-csi-driver
 
 ARG TARGETOS
@@ -36,7 +36,7 @@ ARG EFSUTILSSOURCE=github
 RUN mkdir -p /tmp/rpms && \
     if [ "$EFSUTILSSOURCE" = "yum" ]; \
     then echo "Installing efs-utils from Amazon Linux 2 yum repo" && \
-         yum -y install --downloadonly --downloaddir=/tmp/rpms amazon-efs-utils-1.34.4-1.amzn2.noarch; \
+         yum -y install --downloadonly --downloaddir=/tmp/rpms amazon-efs-utils-1.35.0-1.amzn2.noarch; \
     else echo "Installing efs-utils from github using the latest git tag" && \
          yum -y install git rpm-build make && \
          git clone https://github.com/aws/efs-utils && \
