@@ -11,14 +11,14 @@ useFIPS: false
 
 image:
   repository: amazon/aws-efs-csi-driver
-  tag: "v1.6.0"
+  tag: "v1.7.2"
   pullPolicy: IfNotPresent
 
 sidecars:
   livenessProbe:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/livenessprobe
-      tag: v2.10.0-eks-1-27-3
+      tag: v2.10.0-eks-1-28-4
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -27,7 +27,7 @@ sidecars:
   nodeDriverRegistrar:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/node-driver-registrar
-      tag: v2.8.0-eks-1-27-3
+      tag: v2.8.0-eks-1-28-4
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -36,7 +36,7 @@ sidecars:
   csiProvisioner:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/external-provisioner
-      tag: v3.5.0-eks-1-27-3
+      tag: v3.5.0-eks-1-28-4
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -62,6 +62,7 @@ controller:
   # Enable if you want the controller to also delete the
   # path on efs when deleteing an access point
   deleteAccessPointRootDir: false
+  volMetricsOptIn: false
   podAnnotations: {}
   resources:
     {}
@@ -77,7 +78,11 @@ controller:
     #   memory: 128Mi
   nodeSelector: {}
   updateStrategy: {}
-  tolerations: []
+  tolerations:
+    - key: CriticalAddonsOnly
+      operator: Exists
+    - key: efs.csi.aws.com/agent-not-ready
+      operator: Exists
   affinity: {}
   # Specifies whether a service account should be created
   serviceAccount:
@@ -101,9 +106,6 @@ controller:
 node:
   # Number for the log level verbosity
   logLevel: 2
-  volMetricsOptIn: false
-  volMetricsRefreshPeriod: 240
-  volMetricsFsRateLimit: 5
   hostAliases:
     {}
     # For cross VPC EFS, you need to poison or overwrite the DNS for the efs volume as per
@@ -138,15 +140,6 @@ node:
     # type: OnDelete
   tolerations:
     - operator: Exists
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: eks.amazonaws.com/compute-type
-                operator: NotIn
-                values:
-                  - fargate
   # Specifies whether a service account should be created
   serviceAccount:
     create: true
