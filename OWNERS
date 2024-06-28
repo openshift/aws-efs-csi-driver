@@ -1,15 +1,4 @@
-# See the OWNERS docs at https://go.k8s.io/owners
-
 approvers:
-- d-nishi
-- leakingtapan
-- justinsb
-- jsafrane
-- wongma7
-- nckturner
-- jqmichael
-- Ashley-wenyizha
-- mskanth972
-- dankova22
-- DavidXU12345
-- samuhale
+- openshift-storage-maintainers
+component: "Storage"
+
