@@ -10,15 +10,15 @@ replicaCount: 2
 useFIPS: false
 
 image:
-  repository: amazon/aws-efs-csi-driver
-  tag: "v1.7.2"
+  repository: public.ecr.aws/efs-csi-driver/amazon/aws-efs-csi-driver
+  tag: "v2.0.4"
   pullPolicy: IfNotPresent
 
 sidecars:
   livenessProbe:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/livenessprobe
-      tag: v2.10.0-eks-1-28-4
+      tag: v2.13.0-eks-1-30-8
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -27,7 +27,7 @@ sidecars:
   nodeDriverRegistrar:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/node-driver-registrar
-      tag: v2.8.0-eks-1-28-4
+      tag: v2.11.0-eks-1-30-8
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -36,7 +36,7 @@ sidecars:
   csiProvisioner:
     image:
       repository: public.ecr.aws/eks-distro/kubernetes-csi/external-provisioner
-      tag: v3.5.0-eks-1-28-4
+      tag: v5.0.1-eks-1-30-8
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -62,8 +62,13 @@ controller:
   # Enable if you want the controller to also delete the
   # path on efs when deleteing an access point
   deleteAccessPointRootDir: false
-  volMetricsOptIn: false
   podAnnotations: {}
+  podLabel: {}
+  hostNetwork: false
+  priorityClassName: system-cluster-critical
+  dnsPolicy: ClusterFirst
+  dnsConfig: {}
+  additionalLabels: {}
   resources:
     {}
     # We usually recommend not to specify default resources and to leave this as a conscious
@@ -84,6 +89,9 @@ controller:
     - key: efs.csi.aws.com/agent-not-ready
       operator: Exists
   affinity: {}
+  env: []
+  volumes: []
+  volumeMounts: []
   # Specifies whether a service account should be created
   serviceAccount:
     create: true
@@ -99,6 +107,12 @@ controller:
     runAsUser: 0
     runAsGroup: 0
     fsGroup: 0
+  # securityContext on the controller container
+  # Setting privileged=false will cause the "delete-access-point-root-dir" controller option to fail
+  containerSecurityContext:
+    privileged: true
+  leaderElectionRenewDeadline: 10s
+  leaderElectionLeaseDuration: 15s
 
 
 ## Node daemonset variables
@@ -106,6 +120,9 @@ controller:
 node:
   # Number for the log level verbosity
   logLevel: 2
+  volMetricsOptIn: false
+  volMetricsRefreshPeriod: 240
+  volMetricsFsRateLimit: 5
   hostAliases:
     {}
     # For cross VPC EFS, you need to poison or overwrite the DNS for the efs volume as per
@@ -116,6 +133,7 @@ node:
     # "fs-01234567":
     #   ip: 10.10.2.2
     #   region: us-east-2
+  priorityClassName: system-node-critical
   dnsPolicy: ClusterFirst
   dnsConfig:
     {}
@@ -124,6 +142,7 @@ node:
     # dnsConfig:
     #   nameservers:
     #     - 169.254.169.253
+  podLabels: {}
   podAnnotations: {}
   resources:
     {}
@@ -140,6 +159,15 @@ node:
     # type: OnDelete
   tolerations:
     - operator: Exists
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: eks.amazonaws.com/compute-type
+                operator: NotIn
+                values:
+                  - fargate
   # Specifies whether a service account should be created
   serviceAccount:
     create: true
@@ -155,6 +183,9 @@ node:
     runAsUser: 0
     runAsGroup: 0
     fsGroup: 0
+  env: []
+  volumes: []
+  volumeMounts: []
 
 storageClasses: []
 # Add StorageClass resources like:
