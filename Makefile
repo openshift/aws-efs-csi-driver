@@ -57,7 +57,9 @@ word-hyphen = $(word $2,$(subst -, ,$1))
 .PHONY: linux/$(ARCH) bin/aws-efs-csi-driver
 linux/$(ARCH): bin/aws-efs-csi-driver
 bin/aws-efs-csi-driver: | bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -mod=vendor -ldflags ${LDFLAGS} -o bin/aws-efs-csi-driver ./cmd/
+# OpenShift: <carry>: do not overwrite GOARCH, use the one provided by the builder.
+	@echo GOARCH:${GOARCH}
+	CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags ${LDFLAGS} -o bin/aws-efs-csi-driver ./cmd/
 
 .PHONY: all
 all: all-image-docker
