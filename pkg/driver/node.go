@@ -25,9 +25,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
+	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/util"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -54,7 +56,7 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 }
 
 func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	klog.V(4).Infof("NodePublishVolume: called with args %+v", req)
+	klog.V(4).Infof("NodePublishVolume: called with args %+v", util.SanitizeRequest(*req))
 	mountOptions := []string{}
 
 	target := req.GetTargetPath()
@@ -78,6 +80,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	// TODO when CreateVolume is implemented, it must use the same key names
 	subpath := "/"
 	encryptInTransit := true
+	crossAccountDNSEnabled := false
 	volContext := req.GetVolumeContext()
 	for k, v := range volContext {
 		switch strings.ToLower(k) {
@@ -99,8 +102,14 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		case MountTargetIp:
 			ipAddr := volContext[MountTargetIp]
 			mountOptions = append(mountOptions, MountTargetIp+"="+ipAddr)
+		case CrossAccount:
+			var err error
+			crossAccountDNSEnabled, err = strconv.ParseBool(v)
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Volume context property %q must be a boolean value: %v", k, err))
+			}
 		default:
-			return nil, status.Errorf(codes.InvalidArgument, "Volume context property %s not supported", k)
+			return nil, status.Errorf(codes.InvalidArgument, "Volume context property %s not supported.", k)
 		}
 	}
 
@@ -131,6 +140,10 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		if !hasOption(mountOptions, "tls") {
 			mountOptions = append(mountOptions, "tls")
 		}
+	}
+
+	if crossAccountDNSEnabled {
+		mountOptions = append(mountOptions, CrossAccount)
 	}
 
 	if req.GetReadonly() {
@@ -205,7 +218,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 }
 
 func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	klog.V(4).Infof("NodeUnpublishVolume: called with args %+v", req)
+	klog.V(4).Infof("NodeUnpublishVolume: called with args %+v", util.SanitizeRequest(*req))
 
 	target := req.GetTargetPath()
 	if len(target) == 0 {
@@ -255,7 +268,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 }
 
 func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	klog.V(4).Infof("NodeGetVolumeStats: called with args %+v", req)
+	klog.V(4).Infof("NodeGetVolumeStats: called with args %+v", util.SanitizeRequest(*req))
 
 	volId := req.GetVolumeId()
 	if volId == "" {
@@ -292,7 +305,7 @@ func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolume
 }
 
 func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	klog.V(4).Infof("NodeGetCapabilities: called with args %+v", req)
+	klog.V(4).Infof("NodeGetCapabilities: called with args %+v", util.SanitizeRequest(*req))
 	var caps []*csi.NodeServiceCapability
 	for _, cap := range d.nodeCaps {
 		c := &csi.NodeServiceCapability{
@@ -308,7 +321,7 @@ func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabi
 }
 
 func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	klog.V(4).Infof("NodeGetInfo: called with args %+v", req)
+	klog.V(4).Infof("NodeGetInfo: called with args %+v", util.SanitizeRequest(*req))
 
 	return &csi.NodeGetInfoResponse{
 		NodeId: d.nodeID,
@@ -452,7 +465,7 @@ type JSONPatch struct {
 	Value interface{} `json:"value"`
 }
 
-// removeNotReadyTaint removes the taint ebs.csi.aws.com/agent-not-ready from the local node
+// removeNotReadyTaint removes the taint efs.csi.aws.com/agent-not-ready from the local node
 // This taint can be optionally applied by users to prevent startup race conditions such as
 // https://github.com/kubernetes/kubernetes/issues/95911
 func removeNotReadyTaint(k8sClient cloud.KubernetesAPIClient) error {
@@ -511,4 +524,17 @@ func removeNotReadyTaint(k8sClient cloud.KubernetesAPIClient) error {
 	}
 	klog.InfoS("Removed taint(s) from local node", "node", nodeName)
 	return nil
+}
+
+// remove taint may failed, this keep retring until succeed, make sure the taint will eventually being removed
+func tryRemoveNotReadyTaintUntilSucceed(interval time.Duration, removeFn func() error) {
+	for {
+		err := removeFn()
+		if err == nil {
+			return
+		}
+
+		klog.ErrorS(err, "Unexpected failure when attempting to remove node taint(s)")
+		time.Sleep(interval)
+	}
 }

@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -306,6 +307,30 @@ func TestNodePublishVolume(t *testing.T) {
 			mountSuccess:  true,
 		},
 		{
+			name: "success: normal with crossaccount true volume context",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeId:         volumeId,
+				VolumeCapability: stdVolCap,
+				TargetPath:       targetPath,
+				VolumeContext:    map[string]string{"crossaccount": "true"},
+			},
+			expectMakeDir: true,
+			mountArgs:     []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls", "crossaccount"}},
+			mountSuccess:  true,
+		},
+		{
+			name: "success: normal with crossaccount false volume context",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeId:         volumeId,
+				VolumeCapability: stdVolCap,
+				TargetPath:       targetPath,
+				VolumeContext:    map[string]string{"crossaccount": "false"},
+			},
+			expectMakeDir: true,
+			mountArgs:     []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
+			mountSuccess:  true,
+		},
+		{
 			name: "success: normal with volume context populated from dynamic provisioning",
 			req: &csi.NodePublishVolumeRequest{
 				VolumeId:         volumeId,
@@ -498,7 +523,7 @@ func TestNodePublishVolume(t *testing.T) {
 			expectMakeDir: false,
 			expectError: errtyp{
 				code:    "InvalidArgument",
-				message: "Volume context property asdf not supported",
+				message: "Volume context property asdf not supported.",
 			},
 		},
 		{
@@ -987,4 +1012,33 @@ func getNodeMock(mockCtl *gomock.Controller, nodeName string, returnNode *corev1
 	mockNode.EXPECT().Get(gomock.Any(), gomock.Eq(nodeName), gomock.Any()).Return(returnNode, returnError).MinTimes(1)
 
 	return mockClient, mockNode
+}
+
+func TestTryRemoveNotReadyTaintUntilSucceed(t *testing.T) {
+	{
+		i := 0
+		tryRemoveNotReadyTaintUntilSucceed(time.Second, func() error {
+			i++
+			if i < 3 {
+				return errors.New("test")
+			}
+
+			return nil
+		})
+
+		if i != 3 {
+			t.Fatalf("unexpected result")
+		}
+	}
+	{
+		i := 0
+		tryRemoveNotReadyTaintUntilSucceed(time.Second, func() error {
+			i++
+			return nil
+		})
+
+		if i != 1 {
+			t.Fatalf("unexpected result")
+		}
+	}
 }

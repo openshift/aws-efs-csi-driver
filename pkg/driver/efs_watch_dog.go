@@ -85,9 +85,16 @@ dns_name_suffix = amazonaws.com.cn
 [mount.cn-northwest-1]
 dns_name_suffix = amazonaws.com.cn
 
+[mount.us-iso-west-1]
+dns_name_suffix = c2s.ic.gov
+stunnel_cafile = /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 
 [mount.us-iso-east-1]
 dns_name_suffix = c2s.ic.gov
+stunnel_cafile = /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
+[mount.us-isob-west-1]
+dns_name_suffix = sc2s.sgov.gov
 stunnel_cafile = /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 
 [mount.us-isob-east-1]
@@ -107,6 +114,8 @@ tls_cert_renewal_interval_min = 60
 stunnel_health_check_enabled = true
 stunnel_health_check_interval_min = 5
 stunnel_health_check_command_timeout_sec = 30
+
+enable_version_check = false
 
 [client-info] 
 source={{.EfsClientSource}}
@@ -214,6 +223,11 @@ func copyWithoutOverwriting(srcDir, dstDir string) error {
 
 		if _, err := os.Stat(dst); os.IsNotExist(err) {
 			klog.Infof("Copying %s since it doesn't exist", dst)
+			if err := copyFile(src, dst); err != nil {
+				return err
+			}
+		} else if filepath.Base(src) == "efs-utils.crt" {
+			klog.Infof("Copying %s ", dst)
 			if err := copyFile(src, dst); err != nil {
 				return err
 			}
