@@ -13,6 +13,7 @@ FROM registry.ci.openshift.org/ocp/4.18:aws-efs-utils-base
 # Otherwise creating a host path volume for that directory will clean up everything inside at the first time.
 # Those static files need to be copied back to the config directory when the driver starts up.
 RUN mv /etc/amazon/efs /etc/amazon/efs-static-files
+RUN yum install python3-botocore-1.31.62-1.el9 -y
 
 COPY --from=builder /go/src/github.com/kubernetes-sigs/aws-efs-csi-driver/bin/aws-efs-csi-driver /usr/bin/
 ENTRYPOINT ["/usr/bin/aws-efs-csi-driver"]
