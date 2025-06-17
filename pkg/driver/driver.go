@@ -45,7 +45,6 @@ type Driver struct {
 	efsWatchdog              Watchdog
 	cloud                    cloud.Cloud
 	nodeCaps                 []csi.NodeServiceCapability_RPC_Type
-	volMetricsOptIn          bool
 	volMetricsRefreshPeriod  float64
 	volMetricsFsRateLimit    int
 	volStatter               VolStatter
@@ -55,13 +54,13 @@ type Driver struct {
 	tags                     map[string]string
 }
 
-func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, volMetricsOptIn bool, volMetricsRefreshPeriod float64, volMetricsFsRateLimit int, deleteAccessPointRootDir bool, adaptiveRetryMode bool) *Driver {
+func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, volMetricsRefreshPeriod float64, volMetricsFsRateLimit int, deleteAccessPointRootDir bool, adaptiveRetryMode bool) *Driver {
 	cloud, err := cloud.NewCloud(adaptiveRetryMode)
 	if err != nil {
 		klog.Fatalln(err)
 	}
 
-	nodeCaps := SetNodeCapOptInFeatures(volMetricsOptIn)
+	nodeCaps := SetNodeCapOptInFeatures()
 	watchdog := newExecWatchdog(efsUtilsCfgPath, efsUtilsStaticFilesPath, "amazon-efs-mount-watchdog")
 	return &Driver{
 		endpoint:                 endpoint,
@@ -71,7 +70,6 @@ func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, 
 		cloud:                    cloud,
 		nodeCaps:                 nodeCaps,
 		volStatter:               NewVolStatter(),
-		volMetricsOptIn:          volMetricsOptIn,
 		volMetricsRefreshPeriod:  volMetricsRefreshPeriod,
 		volMetricsFsRateLimit:    volMetricsFsRateLimit,
 		gidAllocator:             NewGidAllocator(),
@@ -81,14 +79,9 @@ func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, 
 	}
 }
 
-func SetNodeCapOptInFeatures(volMetricsOptIn bool) []csi.NodeServiceCapability_RPC_Type {
+func SetNodeCapOptInFeatures() []csi.NodeServiceCapability_RPC_Type {
 	var nCaps = []csi.NodeServiceCapability_RPC_Type{}
-	if volMetricsOptIn {
-		klog.V(4).Infof("Enabling Node Service capability for Get Volume Stats")
-		nCaps = append(nCaps, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS)
-	} else {
-		klog.V(4).Infof("Node Service capability for Get Volume Stats Not enabled")
-	}
+	nCaps = append(nCaps, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS)
 	return nCaps
 }
 

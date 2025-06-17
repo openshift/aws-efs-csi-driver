@@ -206,12 +206,8 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	klog.V(5).Infof("NodePublishVolume: %s was mounted", target)
 
 	//Increment volume Id counter
-	if d.volMetricsOptIn {
-		if value, ok := volumeIdCounter[req.GetVolumeId()]; ok {
-			volumeIdCounter[req.GetVolumeId()] = value + 1
-		} else {
-			volumeIdCounter[req.GetVolumeId()] = 1
-		}
+	if value, ok := volumeIdCounter[req.GetVolumeId()]; ok {
+		volumeIdCounter[req.GetVolumeId()] = value + 1
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
@@ -251,16 +247,14 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 
 	//TODO: If `du` is running on a volume, unmount waits for it to complete. We should stop `du` on unmount in the future for NodeUnpublish
 	//Decrement Volume ID counter and evict cache if counter is 0.
-	if d.volMetricsOptIn {
-		if value, ok := volumeIdCounter[req.GetVolumeId()]; ok {
-			value -= 1
-			if value < 1 {
-				klog.V(4).Infof("Evicting vol ID: %v, vol path : %v from cache", req.VolumeId, target)
-				d.volStatter.removeFromCache(req.VolumeId)
-				delete(volumeIdCounter, req.GetVolumeId())
-			} else {
-				volumeIdCounter[req.GetVolumeId()] = value
-			}
+	if value, ok := volumeIdCounter[req.GetVolumeId()]; ok {
+		value -= 1
+		if value < 1 {
+			klog.V(4).Infof("Evicting vol ID: %v, vol path : %v from cache", req.VolumeId, target)
+			d.volStatter.removeFromCache(req.VolumeId)
+			delete(volumeIdCounter, req.GetVolumeId())
+		} else {
+			volumeIdCounter[req.GetVolumeId()] = value
 		}
 	}
 

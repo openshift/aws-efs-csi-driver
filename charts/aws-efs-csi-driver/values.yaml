@@ -142,7 +142,6 @@ controller:
 node:
   # Number for the log level verbosity
   logLevel: 2
-  volMetricsOptIn: false
   volMetricsRefreshPeriod: 240
   volMetricsFsRateLimit: 5
   hostAliases:

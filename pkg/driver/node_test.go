@@ -43,16 +43,15 @@ type errtyp struct {
 	message string
 }
 
-func setup(mockCtrl *gomock.Controller, volStatter VolStatter, volMetricsOptIn bool) (*mocks.MockMounter, *Driver, context.Context) {
+func setup(mockCtrl *gomock.Controller, volStatter VolStatter) (*mocks.MockMounter, *Driver, context.Context) {
 	mockMounter := mocks.NewMockMounter(mockCtrl)
-	nodeCaps := SetNodeCapOptInFeatures(volMetricsOptIn)
+	nodeCaps := SetNodeCapOptInFeatures()
 	driver := &Driver{
-		endpoint:        "endpoint",
-		nodeID:          "nodeID",
-		mounter:         mockMounter,
-		volStatter:      volStatter,
-		volMetricsOptIn: true,
-		nodeCaps:        nodeCaps,
+		endpoint:   "endpoint",
+		nodeID:     "nodeID",
+		mounter:    mockMounter,
+		volStatter: volStatter,
+		nodeCaps:   nodeCaps,
 	}
 	ctx := context.Background()
 	return mockMounter, driver, ctx
@@ -99,13 +98,12 @@ func TestNodePublishVolume(t *testing.T) {
 	)
 
 	testCases := []struct {
-		name            string
-		req             *csi.NodePublishVolumeRequest
-		expectMakeDir   bool
-		mountArgs       []interface{}
-		mountSuccess    bool
-		volMetricsOptIn bool
-		expectError     errtyp
+		name          string
+		req           *csi.NodePublishVolumeRequest
+		expectMakeDir bool
+		mountArgs     []interface{}
+		mountSuccess  bool
+		expectError   errtyp
 	}{
 		{
 			name: "success: normal",
@@ -114,10 +112,9 @@ func TestNodePublishVolume(t *testing.T) {
 				VolumeCapability: stdVolCap,
 				TargetPath:       targetPath,
 			},
-			expectMakeDir:   true,
-			mountArgs:       []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
-			mountSuccess:    true,
-			volMetricsOptIn: true,
+			expectMakeDir: true,
+			mountArgs:     []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
+			mountSuccess:  true,
 		},
 		{
 			name: "success: empty path",
@@ -126,10 +123,9 @@ func TestNodePublishVolume(t *testing.T) {
 				VolumeCapability: stdVolCap,
 				TargetPath:       targetPath,
 			},
-			expectMakeDir:   true,
-			mountArgs:       []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
-			mountSuccess:    true,
-			volMetricsOptIn: true,
+			expectMakeDir: true,
+			mountArgs:     []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
+			mountSuccess:  true,
 		},
 		{
 			name: "success: empty path and access point",
@@ -138,10 +134,9 @@ func TestNodePublishVolume(t *testing.T) {
 				VolumeCapability: stdVolCap,
 				TargetPath:       targetPath,
 			},
-			expectMakeDir:   true,
-			mountArgs:       []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
-			mountSuccess:    true,
-			volMetricsOptIn: true,
+			expectMakeDir: true,
+			mountArgs:     []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
+			mountSuccess:  true,
 		},
 		{
 			name: "success: normal with read only mount",
@@ -595,7 +590,7 @@ func TestNodePublishVolume(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
-			mockMounter, driver, ctx := setup(mockCtrl, NewVolStatter(), tc.volMetricsOptIn)
+			mockMounter, driver, ctx := setup(mockCtrl, NewVolStatter())
 
 			if tc.expectMakeDir {
 				var err error
@@ -723,7 +718,7 @@ func TestNodeUnpublishVolume(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
-			mockMounter, driver, ctx := setup(mockCtrl, NewVolStatter(), true)
+			mockMounter, driver, ctx := setup(mockCtrl, NewVolStatter())
 
 			if tc.expectGetDeviceName {
 				mockMounter.EXPECT().
@@ -850,7 +845,7 @@ func TestNodeGetVolumeStats(t *testing.T) {
 			//setup
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
-			_, driver, ctx = setup(mockCtrl, NewVolStatter(), true)
+			_, driver, ctx = setup(mockCtrl, NewVolStatter())
 
 			if tc.updateCache {
 				mu.Lock()
