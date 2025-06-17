@@ -60,7 +60,7 @@ func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, 
 		klog.Fatalln(err)
 	}
 
-	nodeCaps := SetNodeCapOptInFeatures()
+	nodeCaps := SetNodeCap()
 	watchdog := newExecWatchdog(efsUtilsCfgPath, efsUtilsStaticFilesPath, "amazon-efs-mount-watchdog")
 	return &Driver{
 		endpoint:                 endpoint,
@@ -79,7 +79,7 @@ func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, 
 	}
 }
 
-func SetNodeCapOptInFeatures() []csi.NodeServiceCapability_RPC_Type {
+func SetNodeCap() []csi.NodeServiceCapability_RPC_Type {
 	var nCaps = []csi.NodeServiceCapability_RPC_Type{}
 	nCaps = append(nCaps, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS)
 	return nCaps

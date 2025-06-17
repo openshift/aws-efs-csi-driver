@@ -66,7 +66,7 @@ func TestSanityEFSCSI(t *testing.T) {
 	config.Address = endpoint
 	config.TestVolumeParameters = parameters
 
-	nodeCaps := SetNodeCapOptInFeatures()
+	nodeCaps := SetNodeCap()
 
 	mockCtrl := gomock.NewController(t)
 	mockCloud := cloud.NewFakeCloudProvider()

@@ -45,7 +45,7 @@ type errtyp struct {
 
 func setup(mockCtrl *gomock.Controller, volStatter VolStatter) (*mocks.MockMounter, *Driver, context.Context) {
 	mockMounter := mocks.NewMockMounter(mockCtrl)
-	nodeCaps := SetNodeCapOptInFeatures()
+	nodeCaps := SetNodeCap()
 	driver := &Driver{
 		endpoint:   "endpoint",
 		nodeID:     "nodeID",
