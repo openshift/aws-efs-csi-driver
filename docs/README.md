@@ -89,6 +89,9 @@ The following sections are Kubernetes specific. If you are a Kubernetes user, us
 | Amazon EFS CSI Driver Version | Image                            |
 |-------------------------------|----------------------------------|
 | master branch                 | amazon/aws-efs-csi-driver:master |
+| v2.1.8                        | amazon/aws-efs-csi-driver:v2.1.8 |
+| v2.1.7                        | amazon/aws-efs-csi-driver:v2.1.7 |
+| v2.1.6                        | amazon/aws-efs-csi-driver:v2.1.6 |
 | v2.1.5                        | amazon/aws-efs-csi-driver:v2.1.5 |
 | v2.1.4                        | amazon/aws-efs-csi-driver:v2.1.4 |
 | v2.1.3                        | amazon/aws-efs-csi-driver:v2.1.3 |
@@ -155,7 +158,7 @@ The following sections are Kubernetes specific. If you are a Kubernetes user, us
 ### ECR Image
 | Driver Version | [ECR](https://gallery.ecr.aws/efs-csi-driver/amazon/aws-efs-csi-driver) Image |
 |----------------|-------------------------------------------------------------------------------|
-| v2.1.5         | public.ecr.aws/efs-csi-driver/amazon/aws-efs-csi-driver:v2.1.5                |
+| v2.1.8         | public.ecr.aws/efs-csi-driver/amazon/aws-efs-csi-driver:v2.1.8                |
 
 **Note**  
 You can find previous efs-csi-driver versions' images from [here](https://gallery.ecr.aws/efs-csi-driver/amazon/aws-efs-csi-driver)
@@ -380,9 +383,27 @@ If you want to update to a specific version, first customize the driver yaml fil
 kubectl kustomize "github.com/kubernetes-sigs/aws-efs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-2.0" > driver.yaml
 ```
 
-Then, update all lines referencing `image: amazon/aws-efs-csi-driver` to the desired version (e.g., to `image: amazon/aws-efs-csi-driver:v2.1.5`) in the yaml file, and deploy driver yaml again:
+Then, update all lines referencing `image: amazon/aws-efs-csi-driver` to the desired version (e.g., to `image: amazon/aws-efs-csi-driver:v2.1.8`) in the yaml file, and deploy driver yaml again:
 ```sh
 kubectl apply -f driver.yaml
+```
+
+### Uninstalling the Amazon EFS CSI Driver
+
+Note: While the aws-efs-csi-driver daemonsets and controller are deleted from the cluster no new EFS PVCs will be able to be created, new pods that are created which use an EFS PV volume will not function (because the PV will not mount), and any existing pods with mounted PVs will not be able to access EFS until the driver is successfully re-installed (either manually, or through the [EKS add-on system](https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html#efs-install-driver)).
+
+Uninstall the self-managed EFS CSI Driver with either Helm or Kustomize, depending on your installation method. If you are using the driver as a managed EKS add-on, see the [EKS Documentation](https://docs.aws.amazon.com/eks/latest/userguide/efs-csi.html#efs-install-driver).
+
+**Helm**
+
+```
+helm uninstall aws-efs-csi-driver --namespace kube-system
+```
+
+**Kustomize**
+
+```
+kubectl delete -k "github.com/kubernetes-sigs/aws-efs-csi-driver/deploy/kubernetes/overlays/stable/?ref=<YOUR-CSI-DRIVER-RELEASE-OR-TAG>"
 ```
 
 ### Examples
