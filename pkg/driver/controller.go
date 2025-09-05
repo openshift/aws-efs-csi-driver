@@ -20,12 +20,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"github.com/google/uuid"
 	"os"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
@@ -73,6 +76,8 @@ var (
 		".PVC.namespace": PvcNamespace,
 		".PV.name":       PvName,
 	}
+
+	waitingForAnotherMount atomic.Int32
 )
 
 func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -413,10 +418,25 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "Could not delete access point root directory %q: %v", accessPoint.AccessPointRootDir, err)
 			}
+
+			klog.Infof("JSAF: before unmount %s", target)
+			if waitingForAnotherMount.Load() == 1 {
+				klog.Infof("JSAF: artificial delay for %s", target)
+				waitingForAnotherMount.Store(0)
+				time.Sleep(30 * time.Second)
+			}
+			klog.Infof("JSAF: unmounting %s", target)
 			err = d.mounter.Unmount(target)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "Could not unmount %q: %v", target, err)
 			}
+
+			waitingForAnotherMount.Store(1)
+			klog.Infof("JSAF: waiting for retried DeleteVolume call for %s", target)
+			for waitingForAnotherMount.Load() == 1 {
+				time.Sleep(1 * time.Second)
+			}
+			klog.Infof("JSAF: deleting %s", target)
 			err = os.RemoveAll(target)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "Could not delete %q: %v", target, err)
