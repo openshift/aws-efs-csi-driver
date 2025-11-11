@@ -12,7 +12,12 @@ FROM registry.ci.openshift.org/ocp/4.21:aws-efs-utils-base
 # client certificate, in the same config directory can be persisted to host with a host path volume.
 # Otherwise creating a host path volume for that directory will clean up everything inside at the first time.
 # Those static files need to be copied back to the config directory when the driver starts up.
-RUN mv /etc/amazon/efs /etc/amazon/efs-static-files
+#
+# However in order to use a read-only root filesystem for the driver container
+# while still being able to write to /etc the static files need to be moved out
+# of /etc in order to be able to remount /etc with r/w emptyDir, since the
+# driver needs to create symlinks there.
+RUN mkdir -p /usr/share/aws-efs-csi-driver &&  mv /etc/amazon/efs /usr/share/aws-efs-csi-driver/efs-static-files
 
 COPY --from=builder /go/src/github.com/kubernetes-sigs/aws-efs-csi-driver/bin/aws-efs-csi-driver /usr/bin/
-ENTRYPOINT ["/usr/bin/aws-efs-csi-driver"]
+ENTRYPOINT ["/usr/bin/aws-efs-csi-driver", "--efs-utils-static-files-path=/usr/share/aws-efs-csi-driver/efs-static-files"]
