@@ -1,3 +1,15 @@
+# V2.1.11
+* Bump k8 version to default 1.33 for e2e tests([#1681](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1681), [@dankova22](https://github.com/dankova22))
+* Update openssl installation change in Dockerfile ([#1678](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1678), [@anthotse](https:///github.com/anthotse))
+* Fix spelling errors and modernize deprecated io/ioutil usage ([#1674](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1674), [@oyiz](https://github.com/oyuz))
+# V2.1.10
+* Update dependencies and fix go.sum ([#1663](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1663), [@anthotse](https://anthotse))
+* Implement ControllerModifyVolume function ([#1663](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1663), [@anthotse](https://anthotse))
+* Update golang in Dockerfile ([#1663](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1663), [@anthotse](https://anthotse)) 
+# V2.1.9
+* Fixing CVEs and depricated pod images ([#1649](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1649)), [@thakurmi](https://github.com/thakurmi)
+* unpinned openssl to fix failing build ([#1638](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1638)), [@thakurmi](https://github.com/thakurmi)
+* CVE-2025-22869: bump golang.org/x/crypto to v0.35.0 ([#1611](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1611)), [@kunalmemane](https://github.com/kunalmemane)
 # V2.1.8
 * Remove unused workflow that publishes images to dockerhub ([#1621](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1621), [@jrakas-dev](https://github.com/jrakas-dev))
 *  Return existing access point if one already exists during create workflow ([#1620](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1620), [@jrakas-dev](https://github.com/jrakas-dev))
