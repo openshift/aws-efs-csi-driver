@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"regexp"
 	"strconv"
 	"sync"
@@ -21,6 +22,8 @@ import (
 
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/driver/mocks"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestCreateVolume(t *testing.T) {
@@ -796,7 +799,11 @@ func TestCreateVolume(t *testing.T) {
 					cloud:        mockCloud,
 					gidAllocator: NewGidAllocator(),
 					lockManager:  NewLockManagerMap(),
-					tags:         parseTagsFromStr("cluster:efs"),
+					tags:         parseTagsFromStr("cluster:efs tag2\\:name2:tag2\\:val2"),
+				}
+
+				if driver.tags["cluster"] != "efs" || driver.tags["tag2:name2"] != "tag2:val2" {
+					t.Fatalf("Incorrect tags %v", driver.tags)
 				}
 
 				req := &csi.CreateVolumeRequest{
@@ -856,7 +863,7 @@ func TestCreateVolume(t *testing.T) {
 					cloud:        mockCloud,
 					gidAllocator: NewGidAllocator(),
 					lockManager:  NewLockManagerMap(),
-					tags:         parseTagsFromStr("cluster-efs"),
+					tags:         parseTagsFromStr("cluster-efs:value1:value2"),
 				}
 
 				req := &csi.CreateVolumeRequest{
@@ -2888,6 +2895,7 @@ func TestCreateVolume(t *testing.T) {
 
 				secrets := map[string]string{}
 				secrets["awsRoleArn"] = "arn:aws:iam::1234567890:role/EFSCrossAccountRole"
+				secrets["externalId"] = "external-id"
 				secrets["crossaccount"] = "true"
 
 				req := &csi.CreateVolumeRequest{
@@ -3347,6 +3355,473 @@ func TestCreateVolume(t *testing.T) {
 					t.Fatal("CreateVolume should have failed due to invalid base path")
 				}
 
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: Filesystem ID from ConfigMap",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+
+				// Mock Kubernetes client with ConfigMap
+				originalClient := cloud.DefaultKubernetesAPIClient
+				defer func() { cloud.DefaultKubernetesAPIClient = originalClient }()
+
+				mockK8sClient := createMockClientWithConfigMap("default", "efs-config", map[string]string{
+					"fileSystemId": fsId,
+				})
+				cloud.DefaultKubernetesAPIClient = func() (kubernetes.Interface, error) {
+					return mockK8sClient, nil
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:      "efs-ap",
+						FileSystemIdConfigRef: "default/efs-config/fileSystemId",
+						DirectoryPerms:        "777",
+						Uid:                   "1000",
+						Gid:                   "1001",
+					},
+				}
+
+				ctx := context.Background()
+				fileSystem := &cloud.FileSystem{
+					FileSystemId: fsId,
+				}
+				accessPoint := &cloud.AccessPoint{
+					AccessPointId: apId,
+					FileSystemId:  fsId,
+				}
+
+				mockCloud.EXPECT().DescribeFileSystem(gomock.Eq(ctx), gomock.Eq(fsId)).Return(fileSystem, nil)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any()).Return(accessPoint, nil)
+
+				res, err := driver.CreateVolume(ctx, req)
+
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
+
+				if res.Volume.VolumeId != volumeId {
+					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", volumeId, res.Volume.VolumeId)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: Filesystem ID from Secret",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+
+				// Mock Kubernetes client with Secret
+				originalClient := cloud.DefaultKubernetesAPIClient
+				defer func() { cloud.DefaultKubernetesAPIClient = originalClient }()
+
+				mockK8sClient := createMockClientWithSecret("kube-system", "efs-secret", map[string][]byte{
+					"fileSystemId": []byte(fsId),
+				})
+				cloud.DefaultKubernetesAPIClient = func() (kubernetes.Interface, error) {
+					return mockK8sClient, nil
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:      "efs-ap",
+						FileSystemIdSecretRef: "kube-system/efs-secret/fileSystemId",
+						DirectoryPerms:        "777",
+						Uid:                   "1000",
+						Gid:                   "1001",
+					},
+				}
+
+				ctx := context.Background()
+				fileSystem := &cloud.FileSystem{
+					FileSystemId: fsId,
+				}
+				accessPoint := &cloud.AccessPoint{
+					AccessPointId: apId,
+					FileSystemId:  fsId,
+				}
+
+				mockCloud.EXPECT().DescribeFileSystem(gomock.Eq(ctx), gomock.Eq(fsId)).Return(fileSystem, nil)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any()).Return(accessPoint, nil)
+
+				res, err := driver.CreateVolume(ctx, req)
+
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
+
+				if res.Volume.VolumeId != volumeId {
+					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", volumeId, res.Volume.VolumeId)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: ConfigMap not found",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+
+				// Mock Kubernetes client with empty clientset (no configmap)
+				originalClient := cloud.DefaultKubernetesAPIClient
+				defer func() { cloud.DefaultKubernetesAPIClient = originalClient }()
+
+				mockK8sClient := createMockClientWithError("configmap not found")
+				cloud.DefaultKubernetesAPIClient = func() (kubernetes.Interface, error) {
+					return mockK8sClient, nil
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:      "efs-ap",
+						FileSystemIdConfigRef: "default/nonexistent/fileSystemId",
+						DirectoryPerms:        "777",
+					},
+				}
+
+				ctx := context.Background()
+				_, err := driver.CreateVolume(ctx, req)
+
+				if err == nil {
+					t.Fatal("CreateVolume should have failed due to missing ConfigMap")
+				}
+
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: Secret not found",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+
+				// Mock Kubernetes client with empty clientset (no secret)
+				originalClient := cloud.DefaultKubernetesAPIClient
+				defer func() { cloud.DefaultKubernetesAPIClient = originalClient }()
+
+				mockK8sClient := createMockClientWithError("secret not found")
+				cloud.DefaultKubernetesAPIClient = func() (kubernetes.Interface, error) {
+					return mockK8sClient, nil
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:      "efs-ap",
+						FileSystemIdSecretRef: "kube-system/nonexistent/fileSystemId",
+						DirectoryPerms:        "777",
+					},
+				}
+
+				ctx := context.Background()
+				_, err := driver.CreateVolume(ctx, req)
+
+				if err == nil {
+					t.Fatal("CreateVolume should have failed due to missing Secret")
+				}
+
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: One Zone EFS with enforceZoneAffinity returns topology",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						DirectoryPerms:      "700",
+						Uid:                 "1000",
+						Gid:                 "1000",
+						EnforceZoneAffinity: "true",
+					},
+				}
+				ctx := context.Background()
+				fileSystem := &cloud.FileSystem{
+					FileSystemId:         fsId,
+					AvailabilityZoneName: "us-east-1b",
+				}
+				accessPoint := &cloud.AccessPoint{
+					AccessPointId: apId,
+					FileSystemId:  fsId,
+				}
+				mockCloud.EXPECT().DescribeFileSystem(gomock.Eq(ctx), gomock.Eq(fsId)).Return(fileSystem, nil).Times(2)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any()).Return(accessPoint, nil)
+				res, err := driver.CreateVolume(ctx, req)
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
+				if res.Volume.AccessibleTopology == nil || len(res.Volume.AccessibleTopology) == 0 {
+					t.Fatal("AccessibleTopology should be set for One Zone EFS with enforceZoneAffinity=true")
+				}
+				if len(res.Volume.AccessibleTopology) != 1 {
+					t.Fatalf("Expected 1 topology, got %d", len(res.Volume.AccessibleTopology))
+				}
+				zone := res.Volume.AccessibleTopology[0].Segments["topology.kubernetes.io/zone"]
+				if zone != "us-east-1b" {
+					t.Fatalf("Expected zone us-east-1b, got %s", zone)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: Regional EFS with enforceZoneAffinity returns no topology",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						DirectoryPerms:      "700",
+						Uid:                 "1000",
+						Gid:                 "1000",
+						EnforceZoneAffinity: "true",
+					},
+				}
+				ctx := context.Background()
+				fileSystem := &cloud.FileSystem{
+					FileSystemId:         fsId,
+					AvailabilityZoneName: "",
+				}
+				accessPoint := &cloud.AccessPoint{
+					AccessPointId: apId,
+					FileSystemId:  fsId,
+				}
+				mockCloud.EXPECT().DescribeFileSystem(gomock.Eq(ctx), gomock.Eq(fsId)).Return(fileSystem, nil).Times(2)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any()).Return(accessPoint, nil)
+				res, err := driver.CreateVolume(ctx, req)
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
+				if res.Volume.AccessibleTopology != nil && len(res.Volume.AccessibleTopology) > 0 {
+					t.Fatalf("AccessibleTopology should be nil/empty for Regional EFS, got %v", res.Volume.AccessibleTopology)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: enforceZoneAffinity not set returns no topology",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode: "efs-ap",
+						FsId:             fsId,
+						DirectoryPerms:   "700",
+						Uid:              "1000",
+						Gid:              "1000",
+					},
+				}
+				ctx := context.Background()
+				fileSystem := &cloud.FileSystem{
+					FileSystemId: fsId,
+				}
+				accessPoint := &cloud.AccessPoint{
+					AccessPointId: apId,
+					FileSystemId:  fsId,
+				}
+				mockCloud.EXPECT().DescribeFileSystem(gomock.Eq(ctx), gomock.Any()).Return(fileSystem, nil)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any()).Return(accessPoint, nil)
+				res, err := driver.CreateVolume(ctx, req)
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
+				if res.Volume.AccessibleTopology != nil && len(res.Volume.AccessibleTopology) > 0 {
+					t.Fatalf("AccessibleTopology should be nil/empty when enforceZoneAffinity not set, got %v", res.Volume.AccessibleTopology)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: enforceZoneAffinity accepts numeric 1",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+				req := &csi.CreateVolumeRequest{
+					Name:               volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{stdVolCap},
+					CapacityRange:      &csi.CapacityRange{RequiredBytes: capacityRange},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						DirectoryPerms:      "700",
+						Uid:                 "1000",
+						Gid:                 "1000",
+						EnforceZoneAffinity: "1",
+					},
+				}
+				ctx := context.Background()
+				fileSystem := &cloud.FileSystem{
+					FileSystemId:         fsId,
+					AvailabilityZoneName: "us-east-1a",
+				}
+				accessPoint := &cloud.AccessPoint{AccessPointId: apId, FileSystemId: fsId}
+				mockCloud.EXPECT().DescribeFileSystem(gomock.Eq(ctx), gomock.Eq(fsId)).Return(fileSystem, nil).Times(2)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any()).Return(accessPoint, nil)
+				res, err := driver.CreateVolume(ctx, req)
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+				if res.Volume.AccessibleTopology == nil || len(res.Volume.AccessibleTopology) == 0 {
+					t.Fatal("AccessibleTopology should be set for enforceZoneAffinity=1")
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: enforceZoneAffinity bad input",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+				req := &csi.CreateVolumeRequest{
+					Name:               volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{stdVolCap},
+					CapacityRange:      &csi.CapacityRange{RequiredBytes: capacityRange},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						DirectoryPerms:      "700",
+						Uid:                 "1000",
+						Gid:                 "1000",
+						EnforceZoneAffinity: "no",
+					},
+				}
+				ctx := context.Background()
+				_, err := driver.CreateVolume(ctx, req)
+				if err == nil {
+					t.Fatal("CreateVolume should have failed with invalid enforceZoneAffinity value")
+				}
 				mockCtl.Finish()
 			},
 		},
@@ -4091,6 +4566,7 @@ func TestDeleteVolume(t *testing.T) {
 
 				secrets := map[string]string{}
 				secrets["awsRoleArn"] = "arn:aws:iam::1234567890:role/EFSCrossAccountRole"
+				secrets["externalId"] = "external-id"
 
 				req := &csi.DeleteVolumeRequest{
 					VolumeId: volumeId,
@@ -4604,6 +5080,95 @@ func TestControllerGetCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ControllerGetCapabilities failed: %v", err)
 	}
+}
+
+func TestTaggingCapabilitites(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "Success: complex split key value colon with backslash",
+			testFunc: func(t *testing.T) {
+				given := "aa\\:bb cc\\\\dd:ee\\:ff gg\\\\hh"
+				expected := []string{"aa:bb cc\\dd", "ee:ff gg\\hh"}
+				result := splitToList(given, byte(':'))
+				if !reflect.DeepEqual(result, expected) {
+					t.Fatalf("Incorrect tags: %v vs. %v", result, expected)
+				}
+			},
+		},
+		{
+			name: "Success: complex split key only colon with backslash",
+			testFunc: func(t *testing.T) {
+				given := "aa\\:bb cc\\\\dd\\\\"
+				expected := []string{"aa:bb cc\\dd\\"}
+				result := splitToList(given, byte(':'))
+				if !reflect.DeepEqual(result, expected) {
+					t.Fatalf("Incorrect tags: %v vs. %v", result, expected)
+				}
+			},
+		},
+		{
+			name: "Success: simple split whitespace",
+			testFunc: func(t *testing.T) {
+				given := "aa:bb cc:dd ee:ff"
+				expected := []string{"aa:bb", "cc:dd", "ee:ff"}
+				result := splitToList(given, byte(' '))
+				if !reflect.DeepEqual(result, expected) {
+					t.Fatalf("Incorrect tags: %v vs. %v", result, expected)
+				}
+			},
+		},
+		{
+			name: "Success: simple single tag",
+			testFunc: func(t *testing.T) {
+				expected := map[string]string{"happy": "case"}
+				result := parseTagsFromStr("happy:case")
+				if !reflect.DeepEqual(result, expected) {
+					t.Fatalf("Incorrect tags: %v vs. %v", result, expected)
+				}
+			},
+		},
+		{
+			name: "Success: simple multiple tags",
+			testFunc: func(t *testing.T) {
+				expected := map[string]string{"firstkey": "firstvalue", "secondkey": "secondvalue"}
+				result := parseTagsFromStr("firstkey:firstvalue secondkey:secondvalue")
+				if !reflect.DeepEqual(result, expected) {
+					t.Fatalf("Incorrect tags: %v vs. %v", result, expected)
+				}
+			},
+		},
+		{
+			name: "Success: complex key escaping",
+			testFunc: func(t *testing.T) {
+				expected := map[string]string{"first:key": "first value", "second key": "second:value"}
+				result := parseTagsFromStr("first\\:key:first\\ value second\\ key:second\\:value")
+				if !reflect.DeepEqual(result, expected) {
+					t.Fatalf("Incorrect tags: %v vs. %v", result, expected)
+				}
+			},
+		},
+		{
+			name: "Success: complex key escaping maintain backslash",
+			testFunc: func(t *testing.T) {
+				expected := map[string]string{"first:key": "first\\value", "second key": "second:value"}
+				result := parseTagsFromStr("first\\:key:first\\\\value second\\ key:second\\:value")
+				if !reflect.DeepEqual(result, expected) {
+					t.Fatalf("Incorrect tags: %v vs. %v", result, expected)
+				}
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
+	}
+}
+
+// Helper function to create mock client that returns error
+func createMockClientWithError(errorMsg string) kubernetes.Interface {
+	return fake.NewSimpleClientset()
 }
 
 func verifyPathWhenUUIDIncluded(pathToVerify string, expectedPathWithoutUUID string) bool {

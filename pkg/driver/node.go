@@ -47,6 +47,10 @@ var (
 	supportedFSTypes = []string{"efs", ""}
 )
 
+const (
+	maxInflightMountCallsReached = "The number of concurrent mount calls is %v, which has reached the limit"
+)
+
 func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
@@ -75,6 +79,17 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 
 	if volCap.GetMount() == nil {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability access type must be mount")
+	}
+
+	if d.inFlightMountTracker != nil {
+		if ok := d.inFlightMountTracker.increment(); !ok {
+			return nil, status.Errorf(codes.Aborted, maxInflightMountCallsReached, d.inFlightMountTracker.maxCount)
+		}
+
+		defer func() {
+			klog.V(4).Infof("NodePublishVolume: volume operation finished for volumeId: %s with %d inflight count before decrementing", req.GetVolumeId(), d.inFlightMountTracker.count)
+			d.inFlightMountTracker.decrement()
+		}()
 	}
 
 	// TODO when CreateVolume is implemented, it must use the same key names
@@ -225,28 +240,37 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
 
-	// Check if target directory is a mount point. GetDeviceNameFromMount
-	// given a mnt point, finds the device from /proc/mounts
-	// returns the device name, reference count, and error code
-	_, refCount, err := d.mounter.GetDeviceName(target)
-	if err != nil {
-		format := "failed to check if volume is mounted: %v"
-		return nil, status.Errorf(codes.Internal, format, err)
+	if d.forceUnmountAfterTimeout {
+		klog.V(5).Infof("NodeUnpublishVolume: will retry unmount %s with force after timeout %v", target, d.unmountTimeout)
+		err := d.mounter.UnmountWithForce(target, d.unmountTimeout)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Could not unmountWithForce %q: %v", target, err)
+		}
+	} else {
+		// Check if target directory is a mount point. GetDeviceNameFromMount
+		// given a mnt point, finds the device from /proc/mounts
+		// returns the device name, reference count, and error code
+		_, refCount, err := d.mounter.GetDeviceName(target)
+		if err != nil {
+			format := "failed to check if volume is mounted: %v"
+			return nil, status.Errorf(codes.Internal, format, err)
+		}
+
+		// From the spec: If the volume corresponding to the volume_id
+		// is not staged to the staging_target_path, the Plugin MUST
+		// reply 0 OK.
+		if refCount == 0 {
+			klog.V(5).Infof("NodeUnpublishVolume: %s target not mounted", target)
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
+
+		klog.V(5).Infof("NodeUnpublishVolume: unmounting %s", target)
+		err = d.mounter.Unmount(target)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Could not unmount %q: %v", target, err)
+		}
 	}
 
-	// From the spec: If the volume corresponding to the volume_id
-	// is not staged to the staging_target_path, the Plugin MUST
-	// reply 0 OK.
-	if refCount == 0 {
-		klog.V(5).Infof("NodeUnpublishVolume: %s target not mounted", target)
-		return &csi.NodeUnpublishVolumeResponse{}, nil
-	}
-
-	klog.V(5).Infof("NodeUnpublishVolume: unmounting %s", target)
-	err = d.mounter.Unmount(target)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "Could not unmount %q: %v", target, err)
-	}
 	klog.V(5).Infof("NodeUnpublishVolume: %s unmounted", target)
 
 	//TODO: If `du` is running on a volume, unmount waits for it to complete. We should stop `du` on unmount in the future for NodeUnpublish
@@ -323,8 +347,18 @@ func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabi
 func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	klog.V(4).Infof("NodeGetInfo: called with args %+v", util.SanitizeRequest(*req))
 
+	maxVolumesPerNode := d.volumeAttachLimit
+	klog.V(4).Infof("NodeGetInfo: maxVolumesPerNode=%d", maxVolumesPerNode)
+
+	availabilityZone := d.cloud.GetMetadata().GetAvailabilityZone()
+	klog.V(4).Infof("NodeGetInfo: availabilityZone=%s", availabilityZone)
+
+	topology := util.BuildTopology(availabilityZone)
+
 	return &csi.NodeGetInfoResponse{
-		NodeId: d.nodeID,
+		NodeId:             d.nodeID,
+		MaxVolumesPerNode:  maxVolumesPerNode,
+		AccessibleTopology: topology,
 	}, nil
 }
 
@@ -469,6 +503,11 @@ type JSONPatch struct {
 // This taint can be optionally applied by users to prevent startup race conditions such as
 // https://github.com/kubernetes/kubernetes/issues/95911
 func removeNotReadyTaint(k8sClient cloud.KubernetesAPIClient) error {
+	if os.Getenv("DISABLE_TAINT_WATCHER") != "" {
+		klog.V(4).InfoS("DISABLE_TAINT_WATCHER set, skipping taint removal")
+		return nil
+	}
+
 	nodeName := os.Getenv("CSI_NODE_NAME")
 	if nodeName == "" {
 		klog.V(4).InfoS("CSI_NODE_NAME missing, skipping taint removal")
@@ -518,10 +557,19 @@ func removeNotReadyTaint(k8sClient cloud.KubernetesAPIClient) error {
 		return err
 	}
 
-	_, err = clientset.CoreV1().Nodes().Patch(context.Background(), nodeName, k8stypes.JSONPatchType, patch, metav1.PatchOptions{})
+	patchedNode, err := clientset.CoreV1().Nodes().Patch(context.Background(), nodeName, k8stypes.JSONPatchType, patch, metav1.PatchOptions{})
 	if err != nil {
 		return err
 	}
+
+	// Verify taint was actually removed from the patched node
+	for _, taint := range patchedNode.Spec.Taints {
+		if taint.Key == AgentNotReadyNodeTaintKey {
+			klog.V(4).InfoS("Taint still present on node, will retry", "key", taint.Key, "effect", taint.Effect)
+			return fmt.Errorf("taint %s still present after patch", AgentNotReadyNodeTaintKey)
+		}
+	}
+
 	klog.InfoS("Removed taint(s) from local node", "node", nodeName)
 	return nil
 }
@@ -537,4 +585,34 @@ func tryRemoveNotReadyTaintUntilSucceed(interval time.Duration, removeFn func() 
 		klog.ErrorS(err, "Unexpected failure when attempting to remove node taint(s)")
 		time.Sleep(interval)
 	}
+}
+
+func getMaxInflightMountCalls(maxInflightMountCallsOptIn bool, maxInflightMountCalls int64) int64 {
+	if maxInflightMountCallsOptIn && maxInflightMountCalls <= 0 {
+		klog.Errorf("Fatal error: maxInflightMountCalls must be greater than 0 when maxInflightMountCallsOptIn is true!")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
+
+	if !maxInflightMountCallsOptIn {
+		klog.V(4).Infof("MaxInflightMountCallsOptIn is false, setting maxInflightMountCalls to %d and inflight check is disabled", UnsetMaxInflightMountCounts)
+		return UnsetMaxInflightMountCounts
+	}
+
+	klog.V(4).Infof("MaxInflightMountCalls is manually set to %d", maxInflightMountCalls)
+	return maxInflightMountCalls
+}
+
+func getVolumeAttachLimit(volumeAttachLimitOptIn bool, volumeAttachLimit int64) int64 {
+	if volumeAttachLimitOptIn && volumeAttachLimit <= 0 {
+		klog.Errorf("Fatal error: volumeAttachLimit must be greater than 0 when volumeAttachLimitOptIn is true!")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
+
+	if !volumeAttachLimitOptIn {
+		klog.V(4).Infof("VolumeAttachLimitOptIn is false, setting maxVolumesPerNode to zero so that container orchestrator will decide the value")
+		return 0
+	}
+
+	klog.V(4).Infof("VolumeAttachLimit is manually set to %d", volumeAttachLimit)
+	return volumeAttachLimit
 }

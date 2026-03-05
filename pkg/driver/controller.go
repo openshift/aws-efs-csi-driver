@@ -47,7 +47,10 @@ const (
 	DefaultTagValue       = "true"
 	DirectoryPerms        = "directoryPerms"
 	EnsureUniqueDirectory = "ensureUniqueDirectory"
+	ExternalId            = "externalId"
 	FsId                  = "fileSystemId"
+	FileSystemIdConfigRef = "fileSystemIdConfigRef"
+	FileSystemIdSecretRef = "fileSystemIdSecretRef"
 	Gid                   = "gid"
 	GidMin                = "gidRangeStart"
 	GidMax                = "gidRangeEnd"
@@ -64,6 +67,7 @@ const (
 	PvcNameKey            = "csi.storage.k8s.io/pvc/name"
 	CrossAccount          = "crossaccount"
 	ApLockWaitTimeSec     = 3
+	EnforceZoneAffinity   = "enforceZoneAffinity"
 )
 
 var (
@@ -101,6 +105,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			klog.V(5).Infof("Client token : %s", clientToken)
 		}
 	}
+
+	var enforceZoneAffinity bool
+	if enforceZoneAffinityStr, ok := volumeParams[EnforceZoneAffinity]; ok {
+		enforceZoneAffinity, err = strconv.ParseBool(enforceZoneAffinityStr)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid value for enforceZoneAffinity parameter")
+		}
+	}
+
 	if volName == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume name not provided")
 	}
@@ -150,14 +163,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		CapacityGiB: volSize,
 	}
 
-	if value, ok := volumeParams[FsId]; ok {
-		if strings.TrimSpace(value) == "" {
-			return nil, status.Errorf(codes.InvalidArgument, "Parameter %v cannot be empty", FsId)
-		}
-		accessPointsOptions.FileSystemId = value
-	} else {
-		return nil, status.Errorf(codes.InvalidArgument, "Missing %v parameter", FsId)
+	value, err := findFileSystemId(ctx, volumeParams)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Failed to resolve filesystem Id %v", err)
 	}
+	accessPointsOptions.FileSystemId = value
 
 	localCloud, roleArn, crossAccountDNSEnabled, err = getCloud(req.GetSecrets(), d)
 	if err != nil {
@@ -399,11 +409,34 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 	}
 
+	// Build topology constraints for One Zone EFS filesystems when enforceZoneAffinity is set
+	var topology []*csi.Topology
+	var fsInfo *cloud.FileSystem
+
+	if enforceZoneAffinity {
+		fsInfo, err = localCloud.DescribeFileSystem(ctx, accessPointsOptions.FileSystemId)
+		if err != nil {
+			klog.Errorf("Failed to describe file system %v: %v", accessPointsOptions.FileSystemId, err)
+			if err == cloud.ErrAccessDenied {
+				return nil, status.Errorf(codes.Unauthenticated, "Access Denied. Please ensure you have the right AWS permissions: %v", err)
+			}
+			if err == cloud.ErrNotFound {
+				return nil, status.Errorf(codes.InvalidArgument, "File System does not exist: %v", err)
+			}
+			return nil, status.Errorf(codes.Internal, "Failed to describe file system for one zone AZ discovery: %v", err)
+		}
+		top := util.BuildTopology(fsInfo.AvailabilityZoneName)
+		if top != nil {
+			topology = []*csi.Topology{top}
+		}
+	}
+
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			CapacityBytes: volSize,
-			VolumeId:      accessPointsOptions.FileSystemId + "::" + accessPoint.AccessPointId,
-			VolumeContext: volContext,
+			CapacityBytes:      volSize,
+			VolumeId:           accessPointsOptions.FileSystemId + "::" + accessPoint.AccessPointId,
+			VolumeContext:      volContext,
+			AccessibleTopology: topology,
 		},
 	}, nil
 }
@@ -644,6 +677,7 @@ func getCloud(secrets map[string]string, driver *Driver) (cloud.Cloud, string, b
 
 	var localCloud cloud.Cloud
 	var roleArn string
+	var externalId string
 	var crossAccountDNSEnabled bool
 	var err error
 
@@ -652,6 +686,10 @@ func getCloud(secrets map[string]string, driver *Driver) (cloud.Cloud, string, b
 	if value, ok := secrets[RoleArn]; ok {
 		roleArn = value
 	}
+	if value, ok := secrets[ExternalId]; ok {
+		externalId = value
+	}
+
 	if value, ok := secrets[CrossAccount]; ok {
 		crossAccountDNSEnabled, err = strconv.ParseBool(value)
 		if err != nil {
@@ -662,7 +700,7 @@ func getCloud(secrets map[string]string, driver *Driver) (cloud.Cloud, string, b
 	}
 
 	if roleArn != "" {
-		localCloud, err = cloud.NewCloudWithRole(roleArn, driver.adaptiveRetryMode)
+		localCloud, err = cloud.NewCloudWithRole(roleArn, externalId, driver.adaptiveRetryMode)
 		if err != nil {
 			return nil, "", false, status.Errorf(codes.Unauthenticated, "Unable to initialize aws cloud: %v. Please verify role has the correct AWS permissions for cross account mount", err)
 		}

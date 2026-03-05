@@ -11,14 +11,14 @@ portRangeUpperBound: "21049"
 
 image:
   repository: public.ecr.aws/efs-csi-driver/amazon/aws-efs-csi-driver
-  tag: "v2.1.10"
+  tag: "v2.3.0"
   pullPolicy: IfNotPresent
 
 sidecars:
   livenessProbe:
     image:
-      repository: public.ecr.aws/eks-distro/kubernetes-csi/livenessprobe
-      tag: v2.15.0-eks-1-33-3
+      repository: public.ecr.aws/csi-components/livenessprobe
+      tag: v2.17.0-eksbuild.3
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -26,8 +26,8 @@ sidecars:
       allowPrivilegeEscalation: false
   nodeDriverRegistrar:
     image:
-      repository: public.ecr.aws/eks-distro/kubernetes-csi/node-driver-registrar
-      tag: v2.13.0-eks-1-33-3
+      repository: public.ecr.aws/csi-components/csi-node-driver-registrar
+      tag: v2.15.0-eksbuild.3
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -35,8 +35,8 @@ sidecars:
       allowPrivilegeEscalation: false
   csiProvisioner:
     image:
-      repository: public.ecr.aws/eks-distro/kubernetes-csi/external-provisioner
-      tag: v5.2.0-eks-1-33-3
+      repository: public.ecr.aws/csi-components/csi-provisioner
+      tag: v6.1.0-eksbuild.2
       pullPolicy: IfNotPresent
     resources: {}
     securityContext:
@@ -86,6 +86,7 @@ controller:
     # requests:
     #   cpu: 100m
     #   memory: 128Mi
+  revisionHistoryLimit: 10
   nodeSelector: {}
   updateStrategy: {}
   tolerations:
@@ -97,6 +98,8 @@ controller:
   env: []
   volumes: []
   volumeMounts: []
+  socketDirVolume:
+    emptyDir: {}
   # Specifies whether a service account should be created
   serviceAccount:
     create: true
@@ -124,6 +127,10 @@ controller:
     privileged: true
   leaderElectionRenewDeadline: 10s
   leaderElectionLeaseDuration: 15s
+  # Timeout for Create/DeleteVolume calls to Controller. We recommend increasing for high concurrency workloads
+  timeout: 15s
+  # Number of concurrent threads controller will handle at once.
+  workerThreads: 100 
   # TSCs without the label selector stanza
   #
   # Example:
@@ -136,6 +143,9 @@ controller:
   #    topologyKey: kubernetes.io/hostname
   #    whenUnsatisfiable: ScheduleAnyway
   topologySpreadConstraints: []
+  # Enable reading filesystem IDs from configmap/secret
+  fileSystemIdRefs:
+    enabled: false
 
 ## Node daemonset variables
 
@@ -175,6 +185,7 @@ node:
     # requests:
     #   cpu: 100m
     #   memory: 128Mi
+  revisionHistoryLimit: 10
   nodeSelector: {}
   updateStrategy:
     {}
@@ -200,6 +211,10 @@ node:
     annotations: {}
     ## Enable if EKS IAM for SA is used
     #  eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/efs-csi-role
+    # Disable mutating permissions for the node service account.
+    # When disableMutation is true, some features of the EFS CSI Driver node pods will not function, such as taint removal.
+    # Primarily useful in particularly security-sensitive environments, or on multi-tenant clusters that isolate tenants by node.
+    disableMutation: false
   healthPort: 9809
   # securityContext on the node pod
   securityContext:
@@ -219,8 +234,6 @@ storageClasses: []
 #   annotations:
 #     # Use that annotation if you want this to your default storageclass
 #     storageclass.kubernetes.io/is-default-class: "true"
-#   mountOptions:
-#   - tls
 #   parameters:
 #     provisioningMode: efs-ap
 #     fileSystemId: fs-1122aabb
