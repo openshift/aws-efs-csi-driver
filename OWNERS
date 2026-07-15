@@ -1,16 +1,3 @@
-# See the OWNERS docs at https://go.k8s.io/owners
-
 approvers:
-- DavidXU12345
-- samuhale
-- vmishra22
-- YangjinanHu
-
-reviewers:
-- DavidXU12345
-- samuhale
-- vmishra22
-- YangjinanHu
-
-emeritus_approvers:
-- dankova22
+- openshift-storage-maintainers
+component: "Storage"
