@@ -370,7 +370,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		if d.deleteAccessPointRootDir {
 			// Check if Access point exists.
 			// If access point exists, retrieve its root directory and delete it/
-			accessPoint, err := localCloud.DescribeAccessPoint(ctx, accessPointId)
+			accessPoint, err := localCloud.DescribeAccessPoint(ctx, accessPointId, fileSystemId)
 			if err != nil {
 				if err == cloud.ErrAccessDenied {
 					return nil, status.Errorf(codes.Unauthenticated, "Access Denied. Please ensure you have the right AWS permissions: %v", err)
@@ -402,7 +402,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 				os.Remove(target)
 				return nil, status.Errorf(codes.Internal, "Could not mount %q at %q: %v", fileSystemId, target, err)
 			}
+			klog.Infof("DeleteVolume: DELETING root directory for access point %s on filesystem %s", accessPointId, fileSystemId)
 			err = os.RemoveAll(target + accessPoint.AccessPointRootDir)
+			if err != nil {
+				klog.Errorf("DeleteVolume: RemoveAll for access point %s FAILED: %v", accessPointId, err)
+			} else {
+				klog.Infof("DeleteVolume: RemoveAll for access point %s SUCCEEDED - directory deleted from filesystem %s", accessPointId, fileSystemId)
+			}
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "Could not delete access point root directory %q: %v", accessPoint.AccessPointRootDir, err)
 			}
