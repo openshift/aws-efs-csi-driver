@@ -35,7 +35,7 @@ func TestCreateVolume(t *testing.T) {
 		volumeName          = "volumeName"
 		fsId                = "fs-abcd1234"
 		apId                = "fsap-abcd1234"
-		volumeId            = "efs:fs-abcd1234::fsap-abcd1234"
+		volumeId            = "fs-abcd1234::fsap-abcd1234"
 		capacityRange int64 = 5368709120
 		stdVolCap           = &csi.VolumeCapability{
 			AccessType: &csi.VolumeCapability_Mount{
@@ -707,7 +707,7 @@ func TestCreateVolume(t *testing.T) {
 
 					found := false
 					for _, ap := range accessPointArr {
-						if result.resp.Volume.VolumeId == fmt.Sprintf("efs:%s::%s", ap.FileSystemId, ap.AccessPointId) {
+						if result.resp.Volume.VolumeId == fmt.Sprintf("%s::%s", ap.FileSystemId, ap.AccessPointId) {
 							found = true
 							break
 						}
@@ -848,6 +848,230 @@ func TestCreateVolume(t *testing.T) {
 			},
 		},
 		{
+			name: "Success: enableTagging=true keeps the default cluster tag",
+			testFunc: func(t *testing.T) {
+				// GIVEN a StorageClass with enableTagging=true and no operator --tags
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode: "efs-ap",
+						FsId:             fsId,
+						DirectoryPerms:   "777",
+						BasePath:         "test",
+						Uid:              "1000",
+						Gid:              "1001",
+						"enableTagging":  "true",
+					},
+				}
+
+				ctx := context.Background()
+				accessPoint := &cloud.AccessPoint{
+					AccessPointId: apId,
+					FileSystemId:  fsId,
+				}
+				// THEN the access point is still stamped with the default cluster tag
+				// (customers key IAM condition keys on it, so it must stay present)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any(), gomock.Eq(util.FileSystemTypeEFS)).Return(accessPoint, nil).
+					Do(func(ctx context.Context, clientToken string, accessPointsOptions *cloud.AccessPointOptions, fsType util.FileSystemType) {
+						if accessPointsOptions.Tags[DefaultTagKey] != DefaultTagValue {
+							t.Fatalf("Expected default tag %q=%q to be present, got tags: %v", DefaultTagKey, DefaultTagValue, accessPointsOptions.Tags)
+						}
+					})
+
+				// WHEN a volume is provisioned
+				res, err := driver.CreateVolume(ctx, req)
+
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
+				if res.Volume.VolumeId != volumeId {
+					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", volumeId, res.Volume.VolumeId)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: enableTagging=false skips all access point tagging",
+			testFunc: func(t *testing.T) {
+				// GIVEN a StorageClass with enableTagging=false and no operator --tags
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode: "efs-ap",
+						FsId:             fsId,
+						DirectoryPerms:   "777",
+						BasePath:         "test",
+						Uid:              "1000",
+						Gid:              "1001",
+						"enableTagging":  "false",
+					},
+				}
+
+				ctx := context.Background()
+				accessPoint := &cloud.AccessPoint{
+					AccessPointId: apId,
+					FileSystemId:  fsId,
+				}
+				// THEN the access point is created with no tags at all, so the driver
+				// issues no Tagris tagging write (this is the EFS-82385 relief path)
+				mockCloud.EXPECT().CreateAccessPoint(gomock.Eq(ctx), gomock.Eq(volumeName), gomock.Any(), gomock.Eq(util.FileSystemTypeEFS)).Return(accessPoint, nil).
+					Do(func(ctx context.Context, clientToken string, accessPointsOptions *cloud.AccessPointOptions, fsType util.FileSystemType) {
+						if len(accessPointsOptions.Tags) != 0 {
+							t.Fatalf("Expected no tags when enableTagging=false, got: %v", accessPointsOptions.Tags)
+						}
+					})
+
+				// WHEN a volume is provisioned
+				res, err := driver.CreateVolume(ctx, req)
+
+				if err != nil {
+					t.Fatalf("CreateVolume failed: %v", err)
+				}
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
+				if res.Volume.VolumeId != volumeId {
+					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", volumeId, res.Volume.VolumeId)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: enableTagging=false with operator --tags returns InvalidArgument",
+			testFunc: func(t *testing.T) {
+				// GIVEN enableTagging=false but the operator also configured --tags
+				// (a contradiction: "don't tag" vs "tag with these")
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+					tags:         parseTagsFromStr("cluster:efs"),
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode: "efs-ap",
+						FsId:             fsId,
+						DirectoryPerms:   "777",
+						BasePath:         "test",
+						Uid:              "1000",
+						Gid:              "1001",
+						"enableTagging":  "false",
+					},
+				}
+
+				ctx := context.Background()
+
+				// WHEN a volume is provisioned
+				_, err := driver.CreateVolume(ctx, req)
+
+				// THEN it fails loud with InvalidArgument and never creates the AP
+				// (no CreateAccessPoint expectation is set on the mock)
+				if err == nil {
+					t.Fatal("CreateVolume did not fail")
+				}
+				if status.Code(err) != codes.InvalidArgument {
+					t.Fatalf("Did not throw InvalidArgument error, instead threw %v", err)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: invalid enableTagging value returns InvalidArgument",
+			testFunc: func(t *testing.T) {
+				// GIVEN a StorageClass with a non-boolean enableTagging value
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode: "efs-ap",
+						FsId:             fsId,
+						DirectoryPerms:   "777",
+						BasePath:         "test",
+						Uid:              "1000",
+						Gid:              "1001",
+						"enableTagging":  "notabool",
+					},
+				}
+
+				ctx := context.Background()
+
+				// WHEN a volume is provisioned
+				_, err := driver.CreateVolume(ctx, req)
+
+				// THEN it fails with InvalidArgument and never creates the AP
+				// (no CreateAccessPoint expectation is set on the mock)
+				if err == nil {
+					t.Fatal("CreateVolume did not fail")
+				}
+				if status.Code(err) != codes.InvalidArgument {
+					t.Fatalf("Did not throw InvalidArgument error, instead threw %v", err)
+				}
+				mockCtl.Finish()
+			},
+		},
+		{
 			name: "Success: Normal flow with invalid tags",
 			testFunc: func(t *testing.T) {
 				mockCtl := gomock.NewController(t)
@@ -964,6 +1188,251 @@ func TestCreateVolume(t *testing.T) {
 					t.Fatal("Volume is nil")
 				}
 
+				if res.Volume.VolumeId != volumeId {
+					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", volumeId, res.Volume.VolumeId)
+				}
+
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: reuseAccessPoint is true but PVC name is empty",
+			testFunc: func(t *testing.T) {
+				// When the external-provisioner runs without --extra-create-metadata
+				// the PVC name is not passed to the driver. Hashing an empty name
+				// would collapse every reuse-enabled volume onto the sha256("")
+				// token and a single shared access point, so the driver must reject
+				// the request instead of silently colliding.
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+					tags:         parseTagsFromStr(""),
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						GidMin:              "1000",
+						GidMax:              "2000",
+						DirectoryPerms:      "777",
+						AzName:              "us-east-1a",
+						ReuseAccessPointKey: "true",
+						// PvcNameKey intentionally omitted (empty PVC name).
+					},
+				}
+
+				ctx := context.Background()
+
+				// No access point lookup or creation should occur; the driver must
+				// fail fast before touching the cloud.
+				_, err := driver.CreateVolume(ctx, req)
+
+				if err == nil {
+					t.Fatal("CreateVolume succeeded but expected an error for empty PVC name")
+				}
+
+				st, ok := status.FromError(err)
+				if !ok || st.Code() != codes.InvalidArgument {
+					t.Fatalf("Expected InvalidArgument error, got: %v", err)
+				}
+
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: reuseAccessPoint precheck rejects existing access point that violates requested StorageClass basePath and UID/GID",
+			testFunc: func(t *testing.T) {
+				// reuseAccessPoint precheck must validate the existing access
+				// point against the requested StorageClass constraints instead
+				// of binding to it unconditionally. A requester who can choose
+				// the PVC name (which derives the reuse client token) must not
+				// be able to bind to an access point rooted under a different
+				// base path or with a different POSIX identity.
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+					tags:         parseTagsFromStr(""),
+				}
+				pvcNameVal := "shared-claim"
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						BasePath:            "/tenant-a",
+						Uid:                 "1000",
+						Gid:                 "1000",
+						DirectoryPerms:      "777",
+						ReuseAccessPointKey: "true",
+						PvcNameKey:          pvcNameVal,
+					},
+				}
+
+				ctx := context.Background()
+
+				// Existing access point belonging to a different tenant: rooted
+				// under /tenant-b and owned by uid/gid 2000.
+				existingAP := &cloud.AccessPoint{
+					AccessPointId:      apId,
+					FileSystemId:       fsId,
+					AccessPointRootDir: "/tenant-b/shared-claim",
+					PosixUser: &cloud.PosixUser{
+						Gid: 2000,
+						Uid: 2000,
+					},
+				}
+				mockCloud.EXPECT().FindAccessPointByClientToken(gomock.Eq(ctx), gomock.Any(), gomock.Eq(fsId), gomock.Eq(util.FileSystemTypeEFS)).Return(existingAP, nil)
+
+				_, err := driver.CreateVolume(ctx, req)
+				if err == nil {
+					t.Fatal("CreateVolume should have rejected the mismatched existing access point")
+				}
+				if status.Code(err) != codes.AlreadyExists {
+					t.Fatalf("Expected error code %v, got %v (err: %v)", codes.AlreadyExists, status.Code(err), err)
+				}
+
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Fail: reuseAccessPoint precheck rejects existing access point whose root only shares a string prefix with basePath",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+					tags:         parseTagsFromStr(""),
+				}
+				pvcNameVal := "shared-claim"
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						BasePath:            "/dir-1",
+						Uid:                 "1000",
+						Gid:                 "1000",
+						DirectoryPerms:      "777",
+						ReuseAccessPointKey: "true",
+						PvcNameKey:          pvcNameVal,
+					},
+				}
+
+				ctx := context.Background()
+
+				existingAP := &cloud.AccessPoint{
+					AccessPointId:      apId,
+					FileSystemId:       fsId,
+					AccessPointRootDir: "/dir-10/dependent-dir",
+					PosixUser: &cloud.PosixUser{
+						Gid: 1000,
+						Uid: 1000,
+					},
+				}
+				mockCloud.EXPECT().FindAccessPointByClientToken(gomock.Eq(ctx), gomock.Any(), gomock.Eq(fsId), gomock.Eq(util.FileSystemTypeEFS)).Return(existingAP, nil)
+
+				_, err := driver.CreateVolume(ctx, req)
+				if err == nil {
+					t.Fatal("CreateVolume should have rejected the prefix-only base path match")
+				}
+				if status.Code(err) != codes.AlreadyExists {
+					t.Fatalf("Expected error code %v, got %v (err: %v)", codes.AlreadyExists, status.Code(err), err)
+				}
+
+				mockCtl.Finish()
+			},
+		},
+		{
+			name: "Success: reuseAccessPoint precheck accepts existing access point rooted under the requested basePath component",
+			testFunc: func(t *testing.T) {
+				mockCtl := gomock.NewController(t)
+				mockCloud := mocks.NewMockCloud(mockCtl)
+
+				driver := &Driver{
+					endpoint:     endpoint,
+					cloud:        mockCloud,
+					gidAllocator: NewGidAllocator(),
+					lockManager:  NewLockManagerMap(),
+					tags:         parseTagsFromStr(""),
+				}
+				pvcNameVal := "shared-claim"
+
+				req := &csi.CreateVolumeRequest{
+					Name: volumeName,
+					VolumeCapabilities: []*csi.VolumeCapability{
+						stdVolCap,
+					},
+					CapacityRange: &csi.CapacityRange{
+						RequiredBytes: capacityRange,
+					},
+					Parameters: map[string]string{
+						ProvisioningMode:    "efs-ap",
+						FsId:                fsId,
+						BasePath:            "/dir-1",
+						Uid:                 "1000",
+						Gid:                 "1000",
+						DirectoryPerms:      "777",
+						ReuseAccessPointKey: "true",
+						PvcNameKey:          pvcNameVal,
+					},
+				}
+
+				ctx := context.Background()
+
+				existingAP := &cloud.AccessPoint{
+					AccessPointId:      apId,
+					FileSystemId:       fsId,
+					AccessPointRootDir: "/dir-1/shared-claim",
+					PosixUser: &cloud.PosixUser{
+						Gid: 1000,
+						Uid: 1000,
+					},
+				}
+				mockCloud.EXPECT().FindAccessPointByClientToken(gomock.Eq(ctx), gomock.Any(), gomock.Eq(fsId), gomock.Eq(util.FileSystemTypeEFS)).Return(existingAP, nil)
+
+				res, err := driver.CreateVolume(ctx, req)
+				if err != nil {
+					t.Fatalf("CreateVolume failed for a valid reused access point: %v", err)
+				}
+				if res.Volume == nil {
+					t.Fatal("Volume is nil")
+				}
 				if res.Volume.VolumeId != volumeId {
 					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", volumeId, res.Volume.VolumeId)
 				}
@@ -3042,7 +3511,7 @@ func TestCreateVolume(t *testing.T) {
 					t.Fatal("Volume is nil")
 				}
 
-				expectedVolumeId := "efs:" + fsId + "::" + apId
+				expectedVolumeId := fsId + "::" + apId
 				if res.Volume.VolumeId != expectedVolumeId {
 					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", expectedVolumeId, res.Volume.VolumeId)
 				}
@@ -3107,7 +3576,7 @@ func TestCreateVolume(t *testing.T) {
 					t.Fatal("Volume is nil")
 				}
 
-				expectedVolumeId := "efs:" + fsId + "::" + apId
+				expectedVolumeId := fsId + "::" + apId
 				if res.Volume.VolumeId != expectedVolumeId {
 					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", expectedVolumeId, res.Volume.VolumeId)
 				}
@@ -3171,7 +3640,7 @@ func TestCreateVolume(t *testing.T) {
 					t.Fatal("Volume is nil")
 				}
 
-				expectedVolumeId := "efs:" + fsId + "::" + apId
+				expectedVolumeId := fsId + "::" + apId
 				if res.Volume.VolumeId != expectedVolumeId {
 					t.Fatalf("Volume Id mismatched. Expected: %v, Actual: %v", expectedVolumeId, res.Volume.VolumeId)
 				}
@@ -4909,7 +5378,7 @@ func TestCreateDeleteVolumeRace(t *testing.T) {
 		apId                = "fsap-abcd1234"
 		fsId                = "fs-abcd1234"
 		endpoint            = "endpoint"
-		volumeId            = "efs:fs-abcd1234::fsap-abcd1234"
+		volumeId            = "fs-abcd1234::fsap-abcd1234"
 		volumeName          = "volumeName"
 		capacityRange int64 = 5368709120
 		stdVolCap           = &csi.VolumeCapability{

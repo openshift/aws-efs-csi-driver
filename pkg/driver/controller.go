@@ -49,6 +49,7 @@ const (
 	DefaultTagKey          = "efs.csi.aws.com/cluster"
 	DefaultTagValue        = "true"
 	DirectoryPerms         = "directoryPerms"
+	EnableTagging          = "enableTagging"
 	EnsureUniqueDirectory  = "ensureUniqueDirectory"
 	ExternalId             = "externalId"
 	FsId                   = "fileSystemId"
@@ -118,6 +119,23 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 	}
 
+	// enableTagging defaults to true to preserve backward compatibility: the
+	// default efs.csi.aws.com/cluster tag is used by customers in IAM condition
+	// keys, so existing StorageClasses must keep tagging access points. Setting it
+	// to false skips access point tagging entirely, letting customers avoid the
+	// throughput limits of tagging every access point.
+	enableTagging := true
+	if enableTaggingStr, ok := volumeParams[EnableTagging]; ok {
+		enableTagging, err = strconv.ParseBool(enableTaggingStr)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid value for enableTagging parameter")
+		}
+	}
+
+	if !enableTagging && len(d.tags) != 0 {
+		return nil, status.Error(codes.InvalidArgument, "enableTagging is false but the driver is configured with --tags; set enableTagging=true or remove the --tags flag")
+	}
+
 	if volName == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume name not provided")
 	}
@@ -142,12 +160,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		azName                 string
 		basePath               string
 		gid                    int64
+		gidSpecified           bool
 		gidMin                 int64
 		gidMax                 int64
 		localCloud             cloud.Cloud
 		provisioningMode       string
 		roleArn                string
 		uid                    int64
+		uidSpecified           bool
 		crossAccountDNSEnabled bool
 		fsType                 util.FileSystemType
 	)
@@ -192,12 +212,29 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			return nil, status.Error(codes.InvalidArgument, "Invalid value for reuseAccessPoint parameter")
 		}
 		if reuseAccessPoint {
-			clientToken = get64LenHash(volumeParams[PvcNameKey])
+			// The reuse client-token is derived from the PVC name only. When the
+			// external-provisioner runs without --extra-create-metadata the PVC name
+			// is not passed to the driver, so hashing it would collapse every
+			// reuse-enabled volume onto the sha256("") token and a single shared
+			// access point. Reject an empty identity instead of silently colliding.
+			pvcName := volumeParams[PvcNameKey]
+			if pvcName == "" {
+				return nil, status.Error(codes.InvalidArgument,
+					"reuseAccessPoint requires a non-empty PVC name; enable the external-provisioner --extra-create-metadata flag so the PVC name is passed to the driver")
+			}
+			clientToken = get64LenHash(pvcName)
 			klog.V(5).Infof("Client token : %s", clientToken)
 		}
 	}
 
 	localCloud, roleArn, crossAccountDNSEnabled, err = getCloud(req.GetSecrets(), d)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse the StorageClass-driven access point constraints (base path, POSIX
+	// uid/gid and gid range).
+	basePath, uid, uidSpecified, gid, gidSpecified, gidMin, gidMax, err = parseAccessPointConstraints(volumeParams)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +250,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if existingAP != nil {
 			//AP path already exists
 			klog.V(2).Infof("Existing AccessPoint found : %+v", existingAP)
+
+			// Enforce the same validation that the CreateAccessPoint ErrAlreadyExists path applies before reusing it.
+			if err = validateExistingAccessPoint(existingAP, basePath, gid, gidSpecified, uid, uidSpecified, gidMin, gidMax); err != nil {
+				return nil, status.Errorf(codes.AlreadyExists, "Invalid existing access point: %v", err)
+			}
+
 			accessPoint = &cloud.AccessPoint{
 				AccessPointId: existingAP.AccessPointId,
 				FileSystemId:  existingAP.FileSystemId,
@@ -229,79 +272,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	if accessPoint == nil {
-		// Create tags
-		tags := map[string]string{
-			DefaultTagKey: DefaultTagValue,
-		}
-
-		// Append input tags to default tag
-		if len(d.tags) != 0 {
-			for k, v := range d.tags {
-				tags[k] = v
-			}
-		}
-
-		accessPointsOptions.Tags = tags
-
-		uid = -1
-		var uidSpecified = false
-		if value, ok := volumeParams[Uid]; ok {
-			uid, err = strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", Uid, err)
-			}
-			if uid < 0 {
-				return nil, status.Errorf(codes.InvalidArgument, "%v must be greater or equal than 0", Uid)
-			}
-			uidSpecified = true
-		}
-
-		gid = -1
-		var gidSpecified = false
-		if value, ok := volumeParams[Gid]; ok {
-			gid, err = strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", Gid, err)
-			}
-			if gid < 0 {
-				return nil, status.Errorf(codes.InvalidArgument, "%v must be greater or equal than 0", Gid)
-			}
-			gidSpecified = true
-		}
-
-		if value, ok := volumeParams[GidMin]; ok {
-			gidMin, err = strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", GidMin, err)
-			}
-			if gidMin <= 0 {
-				return nil, status.Errorf(codes.InvalidArgument, "%v must be greater than 0", GidMin)
-			}
-		}
-
-		if value, ok := volumeParams[GidMax]; ok {
-			// Ensure GID min is provided with GID max
-			if gidMin == 0 {
-				return nil, status.Errorf(codes.InvalidArgument, "Missing %v parameter", GidMin)
-			}
-			gidMax, err = strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return nil, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", GidMax, err)
-			}
-			if gidMax <= gidMin {
-				return nil, status.Errorf(codes.InvalidArgument, "%v must be greater than %v", GidMax, GidMin)
-			}
+		if enableTagging {
+			accessPointsOptions.Tags = d.buildAccessPointTags()
 		} else {
-			// Ensure GID max is provided with GID min
-			if gidMin != 0 {
-				return nil, status.Errorf(codes.InvalidArgument, "Missing %v parameter", GidMax)
-			}
-		}
-
-		// Assign default GID ranges if not provided
-		if gidMin == 0 && gidMax == 0 {
-			gidMin = DefaultGidMin
-			gidMax = DefaultGidMax
+			klog.V(4).Infof("enableTagging=false: skipping access point tagging for volume %s", volName)
 		}
 
 		if value, ok := volumeParams[DirectoryPerms]; ok {
@@ -343,10 +317,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 		if gid == -1 {
 			gid = allocatedGid
-		}
-
-		if value, ok := volumeParams[BasePath]; ok {
-			basePath = value
 		}
 
 		rootDirName := volName
@@ -473,7 +443,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			CapacityBytes:      volSize,
-			VolumeId:           fsType.String() + ":" + accessPointsOptions.FileSystemId + "::" + accessPoint.AccessPointId,
+			VolumeId:           buildVolumeId(fsType, accessPointsOptions.FileSystemId, accessPoint.AccessPointId),
 			VolumeContext:      volContext,
 			AccessibleTopology: topology,
 		},
@@ -600,7 +570,13 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		// Before removing, ensure the removal path exists and is a directory
 		apRootPath := fsRoot + accessPoint.AccessPointRootDir
 		if pathInfo, err := d.mounter.Stat(apRootPath); err == nil && !os.IsNotExist(err) && pathInfo.IsDir() {
+			klog.Infof("DeleteVolume: DELETING root directory for access point %s on filesystem %s", accessPointId, fileSystemId)
 			err = os.RemoveAll(apRootPath)
+			if err != nil {
+				klog.Errorf("DeleteVolume: RemoveAll for access point %s FAILED: %v", accessPointId, err)
+			} else {
+				klog.Infof("DeleteVolume: RemoveAll for access point %s SUCCEEDED - directory deleted from filesystem %s", accessPointId, fileSystemId)
+			}
 		}
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Could not delete access point root directory %q: %v", accessPoint.AccessPointRootDir, err)
@@ -833,17 +809,100 @@ func validatePathRequirements(proposedPath string) (bool, error) {
 	}
 }
 
+// parseAccessPointConstraints parses the StorageClass parameters that define
+// the requested access point's base path and POSIX identity.
+func parseAccessPointConstraints(volumeParams map[string]string) (basePath string, uid int64, uidSpecified bool, gid int64, gidSpecified bool, gidMin int64, gidMax int64, err error) {
+	uid = -1
+	if value, ok := volumeParams[Uid]; ok {
+		uid, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", Uid, err)
+		}
+		if uid < 0 {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "%v must be greater or equal than 0", Uid)
+		}
+		uidSpecified = true
+	}
+
+	gid = -1
+	if value, ok := volumeParams[Gid]; ok {
+		gid, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", Gid, err)
+		}
+		if gid < 0 {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "%v must be greater or equal than 0", Gid)
+		}
+		gidSpecified = true
+	}
+
+	if value, ok := volumeParams[GidMin]; ok {
+		gidMin, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", GidMin, err)
+		}
+		if gidMin <= 0 {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "%v must be greater than 0", GidMin)
+		}
+	}
+
+	if value, ok := volumeParams[GidMax]; ok {
+		// Ensure GID min is provided with GID max
+		if gidMin == 0 {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "Missing %v parameter", GidMin)
+		}
+		gidMax, err = strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "Failed to parse invalid %v: %v", GidMax, err)
+		}
+		if gidMax <= gidMin {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "%v must be greater than %v", GidMax, GidMin)
+		}
+	} else {
+		// Ensure GID max is provided with GID min
+		if gidMin != 0 {
+			return "", 0, false, 0, false, 0, 0, status.Errorf(codes.InvalidArgument, "Missing %v parameter", GidMax)
+		}
+	}
+
+	// Assign default GID ranges if not provided
+	if gidMin == 0 && gidMax == 0 {
+		gidMin = DefaultGidMin
+		gidMax = DefaultGidMax
+	}
+
+	if value, ok := volumeParams[BasePath]; ok {
+		basePath = value
+	}
+
+	return basePath, uid, uidSpecified, gid, gidSpecified, gidMin, gidMax, nil
+}
+
 func get64LenHash(text string) string {
 	h := sha256.New()
 	h.Write([]byte(text))
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// buildAccessPointTags returns the tags applied to a new access point: the
+// default cluster tag plus any operator-provided tags from the --tags flag.
+func (d *Driver) buildAccessPointTags() map[string]string {
+	tags := map[string]string{
+		DefaultTagKey: DefaultTagValue,
+	}
+	for k, v := range d.tags {
+		tags[k] = v
+	}
+	return tags
+}
+
 func validateExistingAccessPoint(existingAccessPoint *cloud.AccessPoint, basePath string, gid int64, gidSpecified bool, uid int64, uidSpecified bool, gidMin int64, gidMax int64) error {
-	normalizedBasePath := strings.TrimPrefix(basePath, "/")
-	normalizedAccessPointPath := strings.TrimPrefix(existingAccessPoint.AccessPointRootDir, "/")
-	if !strings.HasPrefix(normalizedAccessPointPath, normalizedBasePath) {
-		return fmt.Errorf("Access point found but has different base path than what's specified in storage class")
+	normalizedBasePath := strings.Trim(basePath, "/")
+	normalizedAccessPointPath := strings.Trim(existingAccessPoint.AccessPointRootDir, "/")
+	if normalizedBasePath != "" &&
+		normalizedAccessPointPath != normalizedBasePath &&
+		!strings.HasPrefix(normalizedAccessPointPath, normalizedBasePath+"/") {
+		return fmt.Errorf("access point found but has different base path than what's specified in storage class")
 	}
 
 	if existingAccessPoint.PosixUser == nil {

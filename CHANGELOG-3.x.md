@@ -28,3 +28,33 @@
 * feat: add configurable health probes for controller and node components ([#1720](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1720), [@vagharsh](https://github.com/vagharsh))
 * fix(e2e): validate encryptInTransit via efs-proxy --tls flag ([#1878](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1878), [@YangjinanHu](https://github.com/YangjinanHu))
 * fix: add explicit divisor to resourceFieldRef to prevent perpetual diff ([#1899](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1899), [@DavidXU12345](https://github.com/DavidXU12345))
+
+# V3.4.0
+* Add support for API metrics in the EFS CSI Driver ([#1903](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1903), [@andersvw](https://github.com/andersvw))
+* reuseAccessPoint precheck must validate the existing access point against the requested StorageClass constraints instead of binding to it unconditionally ([#1912](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1912), [@zmaguire](https://github.com/zmaguire))
+* feat: add enableTagging StorageClass parameter ([#1916](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1916), [@ABBennett](https://github.com/ABBennett))
+* chart: Add selectorLabels helper ([#1917](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1917), [@YangjinanHu](https://github.com/YangjinanHu))
+
+# V3.4.1
+* Validate access point filesystem ownership in DeleteVolume ([#1926](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1926), [@DavidXU12345](https://github.com/DavidXU12345))
+
+# V3.4.2
+* Reject empty PVC name when reuseAccessPoint is set ([#1927](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1927), [@DavidXU12345](https://github.com/DavidXU12345))
+
+# V3.5.0
+* feat: allow setting environment variables for csi-provisioner ([#1924](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1924), [@jandersen-plaid](https://github.com/jandersen-plaid))
+* fix: synchronize access to volumeIdCounter map in node.go ([#1938](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1938), [@wangnyue](https://github.com/wangnyue))
+* feat: gate startup taint removal on CSINode driver registration ([#1939](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1939), [@wangnyue](https://github.com/wangnyue))
+* fix: restore DNS-name volume handles in static PVs ([#1946](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1946), [@wangnyue](https://github.com/wangnyue))
+* feat: write per-volume mount metadata during NodePublishVolume ([#1948](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1948), [@tzneal](https://github.com/tzneal))
+* fix: emit un-prefixed volume handles for EFS access points ([#1950](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1950), [@vmishra22](https://github.com/vmishra22))
+* fix: validate every mount target IP in the mounttargetipmap attribute ([#1951](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1951), [@vmishra22](https://github.com/vmishra22))
+* fix: quote controller.timeout value in the controller deployment template ([#1952](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1952), [@aliyajo](https://github.com/aliyajo))
+* fix: denylist sensitive keys in efs-utils and s3files-utils conf overrides ([#1955](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1955), [@wangnyue](https://github.com/wangnyue))
+
+# V3.5.1
+* fix: keep efs-utils conf consistent with efs-utils repo ([#1961](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1961), [@DavidXU12345](https://github.com/DavidXU12345))
+* fix: skip libwrap cleanup when efs state directory does not exist ([#1962](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1962), [@KR-Ravindra](https://github.com/KR-Ravindra))
+* fix: update BasePath parsing for reuseAccessPoint ([#1964](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1964), [@samuhale](https://github.com/samuhale))
+* fix: remove startup taint when EFS driver registered without Allocatable ([#1965](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1965), [@wangnyue](https://github.com/wangnyue))
+* fix: reap all orphaned zombies reparented to the driver, not just stunnel/efs-proxy ([#1970](https://github.com/kubernetes-sigs/aws-efs-csi-driver/pull/1970), [@aliyajo](https://github.com/aliyajo))

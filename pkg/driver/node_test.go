@@ -18,20 +18,29 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/driver/mocks"
+	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/util"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -121,6 +130,36 @@ func TestNodePublishVolume(t *testing.T) {
 			},
 			expectMakeDir:         true,
 			mountArgs:             []interface{}{volumeId + ":/", targetPath, "efs", []string{"tls"}},
+			mountSuccess:          true,
+			volMetricsOptIn:       true,
+			maxInflightMountCalls: UnsetMaxInflightMountCounts,
+		},
+		{
+			// DNS-name volumeHandle (static PV): the fsid is passed through
+			// unchanged as the efs-utils mount source, asserted via mountArgs[0].
+			name: "success: efs dns-name volume handle",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeId:         "fs-9919e11b.efs.us-east-1.amazonaws.com",
+				VolumeCapability: stdVolCap,
+				TargetPath:       targetPath,
+			},
+			expectMakeDir:         true,
+			mountArgs:             []interface{}{"fs-9919e11b.efs.us-east-1.amazonaws.com:/", targetPath, "efs", []string{"tls"}},
+			mountSuccess:          true,
+			volMetricsOptIn:       true,
+			maxInflightMountCalls: UnsetMaxInflightMountCounts,
+		},
+		{
+			// AZ-prefixed DNS-name volumeHandle (static PV): the fsid, including
+			// the leading AZ label, is passed through unchanged as the mount source.
+			name: "success: efs dns-name az-prefixed volume handle",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeId:         "us-east-1a.fs-9919e11b.efs.us-east-1.amazonaws.com",
+				VolumeCapability: stdVolCap,
+				TargetPath:       targetPath,
+			},
+			expectMakeDir:         true,
+			mountArgs:             []interface{}{"us-east-1a.fs-9919e11b.efs.us-east-1.amazonaws.com:/", targetPath, "efs", []string{"tls"}},
 			mountSuccess:          true,
 			volMetricsOptIn:       true,
 			maxInflightMountCalls: UnsetMaxInflightMountCounts,
@@ -519,6 +558,37 @@ func TestNodePublishVolume(t *testing.T) {
 			maxInflightMountCalls: UnsetMaxInflightMountCounts,
 		},
 		{
+			// A comma would otherwise be joined into the -o list as extra mount options.
+			name: "fail: mounttargetip carrying additional mount options",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeId:         volumeId,
+				VolumeCapability: stdVolCap,
+				TargetPath:       targetPath,
+				VolumeContext:    map[string]string{"mounttargetip": "10.0.0.1,uid=0,gid=0,port=12345"},
+			},
+			expectMakeDir: false,
+			expectError: errtyp{
+				code:    "InvalidArgument",
+				message: `Volume context property "mounttargetip"="10.0.0.1,uid=0,gid=0,port=12345" is not a valid IP address`,
+			},
+			maxInflightMountCalls: UnsetMaxInflightMountCounts,
+		},
+		{
+			name: "fail: mounttargetip that is not an IP address",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeId:         volumeId,
+				VolumeCapability: stdVolCap,
+				TargetPath:       targetPath,
+				VolumeContext:    map[string]string{"mounttargetip": "not-an-ip"},
+			},
+			expectMakeDir: false,
+			expectError: errtyp{
+				code:    "InvalidArgument",
+				message: `Volume context property "mounttargetip"="not-an-ip" is not a valid IP address`,
+			},
+			maxInflightMountCalls: UnsetMaxInflightMountCounts,
+		},
+		{
 			name: "fail: 'path' is a deprecated and unsupported volume context",
 			req: &csi.NodePublishVolumeRequest{
 				VolumeId:         volumeId,
@@ -543,7 +613,7 @@ func TestNodePublishVolume(t *testing.T) {
 			expectMakeDir: false,
 			expectError: errtyp{
 				code:    "InvalidArgument",
-				message: "volume ID 'invalid-id' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}'",
+				message: "volume ID 'invalid-id' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}' or a mount-target DNS name (e.g. 'fs-abcd1234.efs.<region>.amazonaws.com')",
 			},
 			maxInflightMountCalls: UnsetMaxInflightMountCounts,
 		},
@@ -642,7 +712,7 @@ func TestNodePublishVolume(t *testing.T) {
 			expectMakeDir: false,
 			expectError: errtyp{
 				code:    "InvalidArgument",
-				message: "volume ID 'efs:invalid-id' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}'",
+				message: "volume ID 'efs:invalid-id' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}' or a mount-target DNS name (e.g. 'fs-abcd1234.efs.<region>.amazonaws.com')",
 			},
 		},
 		{
@@ -713,7 +783,7 @@ func TestNodePublishVolume(t *testing.T) {
 			expectMakeDir: false,
 			expectError: errtyp{
 				code:    "InvalidArgument",
-				message: "volume ID 's3files:invalid-id' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}'",
+				message: "volume ID 's3files:invalid-id' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}' or a mount-target DNS name (e.g. 'fs-abcd1234.efs.<region>.amazonaws.com')",
 			},
 		},
 		{
@@ -951,6 +1021,70 @@ func TestNodeUnpublishVolume(t *testing.T) {
 			testResult(t, "NodeUnpublishVolume", ret, err, tc.expectError)
 		})
 	}
+}
+
+// TestNodePublishUnpublishVolumeConcurrent exercises concurrent
+// NodePublishVolume and NodeUnpublishVolume calls (with volMetricsOptIn
+// enabled) to guard against concurrent map read/write panics on the
+// package-level volumeIdCounter map. Run with `go test -race` to verify
+// there is no data race.
+func TestNodePublishUnpublishVolumeConcurrent(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	mockMounter, driver, ctx := setup(mockCtrl, NewVolStatter(), true, UnsetMaxInflightMountCounts)
+
+	stdVolCap := &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Mount{
+			Mount: &csi.VolumeCapability_MountVolume{},
+		},
+		AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+		},
+	}
+
+	// The mounter calls happen for every goroutine with varying volume/target
+	// paths, so allow them to be called any number of times with any args.
+	mockMounter.EXPECT().MakeDir(gomock.Any()).Return(nil).AnyTimes()
+	mockMounter.EXPECT().Mount(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockMounter.EXPECT().GetDeviceName(gomock.Any()).Return("", 1, nil).AnyTimes()
+	mockMounter.EXPECT().Unmount(gomock.Any()).Return(nil).AnyTimes()
+
+	const numGoroutines = 50
+	const numVolumes = 5
+
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			// Reuse a small set of volume IDs across goroutines so that
+			// concurrent Publish/Unpublish calls for the *same* volume ID
+			// exercise the shared volumeIdCounter map entry as well.
+			volID := fmt.Sprintf("fs-abcd%04d", i%numVolumes)
+			target := fmt.Sprintf("/target/path/%d", i)
+
+			publishReq := &csi.NodePublishVolumeRequest{
+				VolumeId:         volID,
+				VolumeCapability: stdVolCap,
+				TargetPath:       target,
+			}
+			if _, err := driver.NodePublishVolume(ctx, publishReq); err != nil {
+				t.Errorf("NodePublishVolume failed: %v", err)
+				return
+			}
+
+			unpublishReq := &csi.NodeUnpublishVolumeRequest{
+				VolumeId:   volID,
+				TargetPath: target,
+			}
+			if _, err := driver.NodeUnpublishVolume(ctx, unpublishReq); err != nil {
+				t.Errorf("NodeUnpublishVolume failed: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestNodeGetVolumeStats(t *testing.T) {
@@ -1351,29 +1485,86 @@ func getNodeMock(mockCtl *gomock.Controller, nodeName string, returnNode *corev1
 
 func TestTryRemoveNotReadyTaintUntilSucceed(t *testing.T) {
 	{
+		// Registration always passes, taint removal fails then succeeds
 		i := 0
-		tryRemoveNotReadyTaintUntilSucceed(time.Second, func() error {
-			i++
-			if i < 3 {
-				return errors.New("test")
-			}
-
-			return nil
-		})
+		tryRemoveNotReadyTaintUntilSucceed(0, time.Millisecond, 10*time.Millisecond,
+			func() error { return nil },
+			func() error {
+				i++
+				if i < 3 {
+					return errors.New("test")
+				}
+				return nil
+			})
 
 		if i != 3 {
-			t.Fatalf("unexpected result")
+			t.Fatalf("unexpected result: got %d, want 3", i)
 		}
 	}
 	{
+		// Registration always passes, taint removal succeeds immediately
 		i := 0
-		tryRemoveNotReadyTaintUntilSucceed(time.Second, func() error {
-			i++
-			return nil
-		})
+		tryRemoveNotReadyTaintUntilSucceed(0, time.Millisecond, 10*time.Millisecond,
+			func() error { return nil },
+			func() error {
+				i++
+				return nil
+			})
 
 		if i != 1 {
-			t.Fatalf("unexpected result")
+			t.Fatalf("unexpected result: got %d, want 1", i)
+		}
+	}
+	{
+		// Registration fails N times then succeeds, taint removal called once and succeeds
+		regCount := 0
+		removeCount := 0
+		tryRemoveNotReadyTaintUntilSucceed(0, time.Millisecond, 10*time.Millisecond,
+			func() error {
+				regCount++
+				if regCount < 4 {
+					return errors.New("not registered yet")
+				}
+				return nil
+			},
+			func() error {
+				removeCount++
+				return nil
+			})
+
+		if regCount != 4 {
+			t.Fatalf("unexpected registration check count: got %d, want 4", regCount)
+		}
+		if removeCount != 1 {
+			t.Fatalf("unexpected remove count: got %d, want 1", removeCount)
+		}
+	}
+	{
+		// Registration fails then succeeds, taint removal fails then succeeds
+		regCount := 0
+		removeCount := 0
+		tryRemoveNotReadyTaintUntilSucceed(0, time.Millisecond, 10*time.Millisecond,
+			func() error {
+				regCount++
+				if regCount < 3 {
+					return errors.New("not registered yet")
+				}
+				return nil
+			},
+			func() error {
+				removeCount++
+				if removeCount < 2 {
+					return errors.New("patch conflict")
+				}
+				return nil
+			})
+
+		// Registration should be called: 2 fails + 1 success for first remove attempt + 1 success for second remove attempt = 4
+		if regCount < 3 {
+			t.Fatalf("unexpected registration check count: got %d, want >= 3", regCount)
+		}
+		if removeCount != 2 {
+			t.Fatalf("unexpected remove count: got %d, want 2", removeCount)
 		}
 	}
 }
@@ -1496,6 +1687,25 @@ func TestIsValidFileSystemId(t *testing.T) {
 		{"invalid: empty", "", false},
 		{"invalid: prefix only", "fs-", false},
 		{"invalid: attack with mount options", "fs-attacktest,exec,suid,dev", false},
+		// DNS-name form used in static PV volumeHandles. Validation is structural
+		// (optional AZ label, strict fs-<hex> id label, DNS-safe domain) rather
+		// than enumerating known domains, so EFS bare, EFS AZ-prefixed, and S3
+		// Files forms are all covered while still blocking mount-option injection.
+		{"valid: efs dns-name", "fs-9919e11b.efs.us-east-1.amazonaws.com", true},
+		{"valid: efs dns-name az-prefixed", "us-east-1a.fs-9919e11b.efs.us-east-1.amazonaws.com", true},
+		{"valid: s3files dns-name", "use1-az1.fs-0123456abcdef0189.s3files.us-east-1.on.aws", true},
+		{"valid: dns-name china", "fs-12345678.efs.cn-north-1.amazonaws.com.cn", true},
+		{"valid: dns-name fips", "fs-12345678.efs-fips.us-east-1.amazonaws.com", true},
+		{"invalid: injected mount options on s3files dns-name", "use1-az1.fs-0123456abcdef0189.s3files.us-east-1.on.aws,exec,suid,dev", false},
+		{"invalid: dns-name az-prefixed id too short", "us-east-1a.fs-1234567.efs.us-east-1.amazonaws.com", false},
+		{"invalid: dns-name az-prefixed non-hex id", "us-east-1a.fs-1234567G.efs.us-east-1.amazonaws.com", false},
+		// DNS labels are case-insensitive, so an uppercase domain must be accepted,
+		// but the fs-<hex> id label itself stays strictly lowercase hex: an
+		// uppercase id label is rejected in the DNS branch just as the bare id
+		// fs-ABCDEF12 is rejected in the bare-id branch.
+		{"valid: efs dns-name uppercase domain", "fs-9919e11b.EFS.us-east-1.amazonaws.com", true},
+		{"invalid: dns-name uppercase id label", "fs-ABCDEF12.efs.us-east-1.amazonaws.com", false},
+		{"invalid: bare id uppercase hex", "fs-ABCDEF12", false},
 	}
 
 	for _, tc := range testCases {
@@ -1503,6 +1713,138 @@ func TestIsValidFileSystemId(t *testing.T) {
 			result := isValidFileSystemId(tc.fsid)
 			if result != tc.expected {
 				t.Errorf("isValidFileSystemId(%q) = %v, expected %v", tc.fsid, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestParseVolumeIdDnsName(t *testing.T) {
+	// A DNS-name volumeHandle (used in static PVs) must parse successfully, keep
+	// the fsid byte-for-byte, and produce an unchanged efs-utils mount source.
+	// Both EFS (fs-<id> as the leading label) and S3 Files (fs-<id> as a middle
+	// label with a different domain) forms are covered.
+	testCases := []struct {
+		name            string
+		volumeId        string
+		expectedFsid    string
+		expectedFsType  util.FileSystemType
+		expectedSubpath string
+	}{
+		{
+			name:            "efs dns-name",
+			volumeId:        "fs-9919e11b.efs.us-east-1.amazonaws.com",
+			expectedFsid:    "fs-9919e11b.efs.us-east-1.amazonaws.com",
+			expectedFsType:  util.FileSystemTypeEFS,
+			expectedSubpath: "/",
+		},
+		{
+			name:            "s3files dns-name",
+			volumeId:        "s3files:use1-az1.fs-0123456abcdef0189.s3files.us-east-1.on.aws",
+			expectedFsid:    "use1-az1.fs-0123456abcdef0189.s3files.us-east-1.on.aws",
+			expectedFsType:  util.FileSystemTypeS3Files,
+			expectedSubpath: "/",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fsid, subpath, apid, fsType, err := parseVolumeId(tc.volumeId)
+			if err != nil {
+				t.Fatalf("parseVolumeId(%q) returned unexpected error: %v", tc.volumeId, err)
+			}
+			if fsid != tc.expectedFsid {
+				t.Errorf("parseVolumeId(%q) fsid = %q, expected %q (must be unchanged)", tc.volumeId, fsid, tc.expectedFsid)
+			}
+			if apid != "" {
+				t.Errorf("parseVolumeId(%q) apid = %q, expected empty", tc.volumeId, apid)
+			}
+			if fsType != tc.expectedFsType {
+				t.Errorf("parseVolumeId(%q) fsType = %q, expected %q", tc.volumeId, fsType, tc.expectedFsType)
+			}
+
+			// The efs-utils mount source is built in NodePublishVolume (asserted
+			// end-to-end via the gomock Mount expectation in TestNodePublishVolume).
+			// Here we only assert that parseVolumeId keeps the fsid unchanged and
+			// derives the subpath correctly, which are the inputs to that source.
+			if subpath == "" {
+				subpath = "/"
+			}
+			if subpath != tc.expectedSubpath {
+				t.Errorf("parseVolumeId(%q) subpath = %q, expected %q", tc.volumeId, subpath, tc.expectedSubpath)
+			}
+		})
+	}
+}
+
+func TestIsValidMountTargetIP(t *testing.T) {
+	testCases := []struct {
+		name     string
+		value    string
+		expected bool
+	}{
+		{"valid: IPv4", "10.0.1.1", true},
+		{"valid: IPv6", "2600:1f14:abc:1234::1", true},
+		{"valid: IPv6 loopback", "::1", true},
+		{"invalid: trailing mount options", "10.0.1.1,uid=0,gid=0,port=12345", false},
+		{"invalid: leading mount option", "uid=0,10.0.1.1", false},
+		{"invalid: whitespace separated option", "10.0.1.1 uid=0", false},
+		{"invalid: hostname", "fs-abcd1234.efs.us-east-1.amazonaws.com", false},
+		{"invalid: not an IP", "not-an-ip", false},
+		{"invalid: empty", "", false},
+		{"invalid: IPv4 with port", "10.0.1.1:2049", false},
+		{"invalid: CIDR", "10.0.1.0/24", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := isValidMountTargetIP(tc.value)
+			if result != tc.expected {
+				t.Errorf("isValidMountTargetIP(%q) = %v, expected %v", tc.value, result, tc.expected)
+			}
+		})
+	}
+}
+
+func TestBuildVolumeId(t *testing.T) {
+	testCases := []struct {
+		name     string
+		fsType   util.FileSystemType
+		fsid     string
+		apid     string
+		expected string
+	}{
+		{
+			name:     "EFS omits the type prefix",
+			fsType:   util.FileSystemTypeEFS,
+			fsid:     "fs-abcd1234",
+			apid:     "fsap-abcd1234",
+			expected: "fs-abcd1234::fsap-abcd1234",
+		},
+		{
+			name:     "S3 Files carries the type prefix",
+			fsType:   util.FileSystemTypeS3Files,
+			fsid:     "fs-abcd1234",
+			apid:     "fsap-abcd1234",
+			expected: "s3files:fs-abcd1234::fsap-abcd1234",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildVolumeId(tc.fsType, tc.fsid, tc.apid)
+			if got != tc.expected {
+				t.Fatalf("buildVolumeId(%q, %q, %q) = %q, expected %q", tc.fsType, tc.fsid, tc.apid, got, tc.expected)
+			}
+
+			// parseVolumeId is the inverse, so every handle this driver emits must
+			// resolve back to the same file system, access point and type.
+			fsid, subpath, apid, fsType, err := parseVolumeId(got)
+			if err != nil {
+				t.Fatalf("parseVolumeId(%q) returned an error: %v", got, err)
+			}
+			if fsid != tc.fsid || apid != tc.apid || fsType != tc.fsType || subpath != "" {
+				t.Errorf("parseVolumeId(%q) = (%q, %q, %q, %q), expected (%q, \"\", %q, %q)",
+					got, fsid, subpath, apid, fsType, tc.fsid, tc.apid, tc.fsType)
 			}
 		})
 	}
@@ -1551,6 +1893,11 @@ func TestNodePublishVolumeMountTargetIpMap(t *testing.T) {
 		// expected mounttargetip value in mount options, empty if none expected
 		expectedIP  string
 		expectError bool
+		// substring the error must contain, checked only when set
+		expectErrContains string
+		// gRPC code the error must carry, checked only when set. kubelet retry
+		// behavior depends on this, so a rejection is not enough on its own.
+		expectErrCode codes.Code
 	}{
 		{
 			name:       "node AZ found in map",
@@ -1569,6 +1916,74 @@ func TestNodePublishVolumeMountTargetIpMap(t *testing.T) {
 			nodeAZ:      "us-west-2a",
 			ipMapJSON:   `{invalid`,
 			expectError: true,
+		},
+		{
+			name:              "comma in the node AZ value is rejected instead of injecting mount options",
+			nodeAZ:            "us-west-2a",
+			ipMapJSON:         `{"us-west-2a":"10.0.1.1,uid=0,gid=0,port=12345"}`,
+			expectError:       true,
+			expectErrCode:     codes.InvalidArgument,
+			expectErrContains: `has an invalid IP address "10.0.1.1,uid=0,gid=0,port=12345" for availability zone "us-west-2a"`,
+		},
+		{
+			// The entry this node would not have selected is still rejected, so a
+			// tampered map cannot mount on some nodes and inject on others.
+			name:              "comma in another AZ value is rejected even though this node resolves elsewhere",
+			nodeAZ:            "us-west-2b",
+			ipMapJSON:         `{"us-west-2a":"10.0.1.1,uid=0","us-west-2b":"10.0.2.1"}`,
+			expectError:       true,
+			expectErrCode:     codes.InvalidArgument,
+			expectErrContains: `has an invalid IP address "10.0.1.1,uid=0" for availability zone "us-west-2a"`,
+		},
+		{
+			// The escape is decoded before validation, so escaping the separator
+			// does not get it past the check.
+			name:              "unicode-escaped comma is rejected",
+			nodeAZ:            "us-west-2a",
+			ipMapJSON:         `{"us-west-2a":"10.0.1.1\u002cuid=0"}`,
+			expectError:       true,
+			expectErrCode:     codes.InvalidArgument,
+			expectErrContains: `has an invalid IP address "10.0.1.1,uid=0"`,
+		},
+		{
+			name:              "non-IP value is rejected",
+			nodeAZ:            "us-west-2a",
+			ipMapJSON:         `{"us-west-2a":"not-an-ip"}`,
+			expectError:       true,
+			expectErrCode:     codes.InvalidArgument,
+			expectErrContains: `has an invalid IP address "not-an-ip"`,
+		},
+		{
+			name:              "empty value is rejected",
+			nodeAZ:            "us-west-2a",
+			ipMapJSON:         `{"us-west-2a":""}`,
+			expectError:       true,
+			expectErrCode:     codes.InvalidArgument,
+			expectErrContains: `has an invalid IP address ""`,
+		},
+		{
+			// JSON null decodes to the empty string rather than failing to unmarshal.
+			name:              "null value is rejected",
+			nodeAZ:            "us-west-2a",
+			ipMapJSON:         `{"us-west-2a":null}`,
+			expectError:       true,
+			expectErrCode:     codes.InvalidArgument,
+			expectErrContains: `has an invalid IP address ""`,
+		},
+		{
+			// A type error leaves the map partially populated, so the unmarshal error
+			// must be returned before any entry is read.
+			name:          "non-string value is rejected before the map is used",
+			nodeAZ:        "us-west-2a",
+			ipMapJSON:     `{"us-west-2a":"10.0.1.1","us-west-2b":123}`,
+			expectError:   true,
+			expectErrCode: codes.InvalidArgument,
+		},
+		{
+			name:       "IPv6 address is accepted",
+			nodeAZ:     "us-west-2a",
+			ipMapJSON:  `{"us-west-2a":"2600:1f14:abc:1234::1"}`,
+			expectedIP: "2600:1f14:abc:1234::1",
 		},
 	}
 
@@ -1614,6 +2029,12 @@ func TestNodePublishVolumeMountTargetIpMap(t *testing.T) {
 				if err == nil {
 					t.Fatal("Expected error but got nil")
 				}
+				if tc.expectErrCode != codes.OK && status.Code(err) != tc.expectErrCode {
+					t.Fatalf("Expected gRPC code %v, got %v (%v)", tc.expectErrCode, status.Code(err), err)
+				}
+				if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
+					t.Fatalf("Expected error containing %q, got %q", tc.expectErrContains, err.Error())
+				}
 			} else {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
@@ -1624,4 +2045,543 @@ func TestNodePublishVolumeMountTargetIpMap(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCheckDriverRegistration(t *testing.T) {
+	nodeName := "test-node-123"
+	testDriverName := "efs.csi.aws.com"
+	int32Val := int32(10)
+
+	testCases := []struct {
+		name      string
+		setup     func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error)
+		expectErr bool
+		errSubstr string
+	}{
+		{
+			name: "CSI_NODE_NAME not set",
+			setup: func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error) {
+				t.Setenv("CSI_NODE_NAME", "")
+				return func() (kubernetes.Interface, error) {
+					t.Fatalf("Unexpected call to k8s client getter")
+					return nil, nil
+				}
+			},
+			expectErr: true,
+			errSubstr: "CSI_NODE_NAME not set",
+		},
+		{
+			name: "k8s client creation fails",
+			setup: func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error) {
+				t.Setenv("CSI_NODE_NAME", nodeName)
+				return func() (kubernetes.Interface, error) {
+					return nil, fmt.Errorf("failed to create client")
+				}
+			},
+			expectErr: true,
+			errSubstr: "failed to create kubernetes client",
+		},
+		{
+			name: "CSINode Get returns not-found",
+			setup: func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error) {
+				t.Setenv("CSI_NODE_NAME", nodeName)
+				mockClient := mocks.NewMockKubernetesClient(mockCtl)
+				mockStorageV1 := mocks.NewMockStorageV1Interface(mockCtl)
+				mockCSINode := mocks.NewMockCSINodeInterface(mockCtl)
+
+				mockClient.EXPECT().StorageV1().Return(mockStorageV1).MinTimes(1)
+				mockStorageV1.EXPECT().CSINodes().Return(mockCSINode).MinTimes(1)
+				mockCSINode.EXPECT().Get(gomock.Any(), gomock.Eq(nodeName), gomock.Any()).Return(nil,
+					apierrors.NewNotFound(schema.GroupResource{Group: "storage.k8s.io", Resource: "csinodes"}, nodeName))
+
+				return func() (kubernetes.Interface, error) {
+					return mockClient, nil
+				}
+			},
+			expectErr: true,
+			errSubstr: "failed to get CSINode",
+		},
+		{
+			name: "CSINode Get returns forbidden",
+			setup: func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error) {
+				t.Setenv("CSI_NODE_NAME", nodeName)
+				mockClient := mocks.NewMockKubernetesClient(mockCtl)
+				mockStorageV1 := mocks.NewMockStorageV1Interface(mockCtl)
+				mockCSINode := mocks.NewMockCSINodeInterface(mockCtl)
+
+				mockClient.EXPECT().StorageV1().Return(mockStorageV1).MinTimes(1)
+				mockStorageV1.EXPECT().CSINodes().Return(mockCSINode).MinTimes(1)
+				mockCSINode.EXPECT().Get(gomock.Any(), gomock.Eq(nodeName), gomock.Any()).Return(nil,
+					apierrors.NewForbidden(schema.GroupResource{Group: "storage.k8s.io", Resource: "csinodes"}, nodeName, fmt.Errorf("forbidden")))
+
+				return func() (kubernetes.Interface, error) {
+					return mockClient, nil
+				}
+			},
+			expectErr: true,
+			errSubstr: "failed to get CSINode",
+		},
+		{
+			name: "CSINode exists but driver not listed",
+			setup: func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error) {
+				t.Setenv("CSI_NODE_NAME", nodeName)
+				mockClient := mocks.NewMockKubernetesClient(mockCtl)
+				mockStorageV1 := mocks.NewMockStorageV1Interface(mockCtl)
+				mockCSINode := mocks.NewMockCSINodeInterface(mockCtl)
+
+				mockClient.EXPECT().StorageV1().Return(mockStorageV1).MinTimes(1)
+				mockStorageV1.EXPECT().CSINodes().Return(mockCSINode).MinTimes(1)
+				mockCSINode.EXPECT().Get(gomock.Any(), gomock.Eq(nodeName), gomock.Any()).Return(&storagev1.CSINode{
+					Spec: storagev1.CSINodeSpec{
+						Drivers: []storagev1.CSINodeDriver{
+							{Name: "some.other.driver"},
+						},
+					},
+				}, nil)
+
+				return func() (kubernetes.Interface, error) {
+					return mockClient, nil
+				}
+			},
+			expectErr: true,
+			errSubstr: "not yet listed in CSINode",
+		},
+		{
+			name: "CSINode exists, driver listed, Allocatable nil - success (EFS has no attach limit)",
+			setup: func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error) {
+				t.Setenv("CSI_NODE_NAME", nodeName)
+				mockClient := mocks.NewMockKubernetesClient(mockCtl)
+				mockStorageV1 := mocks.NewMockStorageV1Interface(mockCtl)
+				mockCSINode := mocks.NewMockCSINodeInterface(mockCtl)
+
+				mockClient.EXPECT().StorageV1().Return(mockStorageV1).MinTimes(1)
+				mockStorageV1.EXPECT().CSINodes().Return(mockCSINode).MinTimes(1)
+				mockCSINode.EXPECT().Get(gomock.Any(), gomock.Eq(nodeName), gomock.Any()).Return(&storagev1.CSINode{
+					Spec: storagev1.CSINodeSpec{
+						Drivers: []storagev1.CSINodeDriver{
+							{
+								Name:        testDriverName,
+								Allocatable: nil,
+							},
+						},
+					},
+				}, nil)
+
+				return func() (kubernetes.Interface, error) {
+					return mockClient, nil
+				}
+			},
+			expectErr: false,
+		},
+		{
+			name: "CSINode exists, driver listed, Allocatable set - success",
+			setup: func(t *testing.T, mockCtl *gomock.Controller) func() (kubernetes.Interface, error) {
+				t.Setenv("CSI_NODE_NAME", nodeName)
+				mockClient := mocks.NewMockKubernetesClient(mockCtl)
+				mockStorageV1 := mocks.NewMockStorageV1Interface(mockCtl)
+				mockCSINode := mocks.NewMockCSINodeInterface(mockCtl)
+
+				mockClient.EXPECT().StorageV1().Return(mockStorageV1).MinTimes(1)
+				mockStorageV1.EXPECT().CSINodes().Return(mockCSINode).MinTimes(1)
+				mockCSINode.EXPECT().Get(gomock.Any(), gomock.Eq(nodeName), gomock.Any()).Return(&storagev1.CSINode{
+					Spec: storagev1.CSINodeSpec{
+						Drivers: []storagev1.CSINodeDriver{
+							{
+								Name: testDriverName,
+								Allocatable: &storagev1.VolumeNodeResources{
+									Count: &int32Val,
+								},
+							},
+						},
+					},
+				}, nil)
+
+				return func() (kubernetes.Interface, error) {
+					return mockClient, nil
+				}
+			},
+			expectErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockCtl := gomock.NewController(t)
+			defer mockCtl.Finish()
+
+			k8sClientGetter := tc.setup(t, mockCtl)
+			err := checkDriverRegistration(k8sClientGetter, testDriverName)
+			if tc.expectErr {
+				if err == nil {
+					t.Fatalf("Expected error containing %q, got nil", tc.errSubstr)
+				}
+				if !strings.Contains(err.Error(), tc.errSubstr) {
+					t.Fatalf("Expected error containing %q, got: %v", tc.errSubstr, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Expected nil error, got: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestEfsMetaFile(t *testing.T) {
+	stdVolCap := &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Mount{
+			Mount: &csi.VolumeCapability_MountVolume{},
+		},
+		AccessMode: &csi.VolumeCapability_AccessMode{
+			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+		},
+	}
+
+	newDriver := func(t *testing.T, mounter Mounter) *Driver {
+		t.Helper()
+		return &Driver{
+			endpoint:             "endpoint",
+			nodeID:               "nodeID",
+			mounter:              mounter,
+			volMetricsOptIn:      true,
+			volStatter:           NewVolStatter(),
+			nodeCaps:             SetNodeCapOptInFeatures(true),
+			inFlightMountTracker: NewInFlightMountTracker(UnsetMaxInflightMountCounts),
+			metaDir:              filepath.Join(t.TempDir(), "mounts"),
+		}
+	}
+
+	setupPublish := func(t *testing.T) (driver *Driver, ctrl *gomock.Controller, target string) {
+		t.Helper()
+		t.Setenv("CSI_NODE_MEMORY_LIMIT", strconv.Itoa(minMemoryInBytesToEnableS3ReadCache*2))
+		ctrl = gomock.NewController(t)
+		target = filepath.Join(t.TempDir(), "mount")
+
+		mockMounter := mocks.NewMockMounter(ctrl)
+		mockMounter.EXPECT().MakeDir(gomock.Eq(target)).Return(nil)
+		mockMounter.EXPECT().Mount(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		return newDriver(t, mockMounter), ctrl, target
+	}
+
+	publishReq := func(target string) *csi.NodePublishVolumeRequest {
+		return &csi.NodePublishVolumeRequest{
+			VolumeId:         volumeId,
+			VolumeCapability: stdVolCap,
+			TargetPath:       target,
+		}
+	}
+
+	publish := func(t *testing.T, driver *Driver, req *csi.NodePublishVolumeRequest) {
+		t.Helper()
+		if _, err := driver.NodePublishVolume(context.Background(), req); err != nil {
+			t.Fatalf("NodePublishVolume failed: %v", err)
+		}
+	}
+
+	readMeta := func(t *testing.T, driver *Driver, target string) efsVolumeMeta {
+		t.Helper()
+		metaPath := driver.efsMetaPath(target)
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			t.Fatalf("expected meta file %s to exist: %v", metaPath, err)
+		}
+		var meta efsVolumeMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			t.Fatalf("failed to parse meta file: %v", err)
+		}
+		return meta
+	}
+
+	seedMeta := func(t *testing.T, driver *Driver, target string) {
+		t.Helper()
+		metaPath := driver.efsMetaPath(target)
+		if err := os.MkdirAll(filepath.Dir(metaPath), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(metaPath, []byte(`{"schemaVersion":1}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("publish writes meta file with all fields", func(t *testing.T) {
+		driver, _, target := setupPublish(t)
+
+		req := publishReq(target)
+		req.VolumeId = "fs-abc12345:/data:fsap-deadbeef"
+		req.Readonly = true
+		req.VolumeContext = map[string]string{"mounttargetip": "10.0.0.5"}
+		publish(t, driver, req)
+
+		meta := readMeta(t, driver, target)
+		if meta.SchemaVersion != 1 {
+			t.Errorf("schemaVersion = %d, want 1", meta.SchemaVersion)
+		}
+		if meta.Target != target {
+			t.Errorf("target = %q, want %q", meta.Target, target)
+		}
+		if meta.FsType != "efs" {
+			t.Errorf("fsType = %q, want %q", meta.FsType, "efs")
+		}
+		if meta.VolumeHandle.FileSystemID != "fs-abc12345" {
+			t.Errorf("volumeHandle.fileSystemId = %q, want %q", meta.VolumeHandle.FileSystemID, "fs-abc12345")
+		}
+		if meta.VolumeHandle.ExportPath != "/data" {
+			t.Errorf("volumeHandle.exportPath = %q, want %q", meta.VolumeHandle.ExportPath, "/data")
+		}
+		if meta.VolumeHandle.AccessPointID != "fsap-deadbeef" {
+			t.Errorf("volumeHandle.accessPointId = %q, want %q", meta.VolumeHandle.AccessPointID, "fsap-deadbeef")
+		}
+		if meta.VolumeContext.MountTargetIP != "10.0.0.5" {
+			t.Errorf("volumeContext.mountTargetIp = %q, want %q", meta.VolumeContext.MountTargetIP, "10.0.0.5")
+		}
+		if !meta.VolumeContext.EncryptInTransit {
+			t.Error("volumeContext.encryptInTransit = false, want true")
+		}
+		if !meta.ReadOnly {
+			t.Error("readOnly = false, want true")
+		}
+		if !hasOption(meta.MountFlags, "tls") ||
+			!hasOption(meta.MountFlags, "accesspoint=fsap-deadbeef") {
+			t.Errorf("mountFlags missing expected entries: %v", meta.MountFlags)
+		}
+	})
+
+	t.Run("publish without mounttargetip omits field", func(t *testing.T) {
+		driver, _, target := setupPublish(t)
+		publish(t, driver, publishReq(target))
+
+		data, err := os.ReadFile(driver.efsMetaPath(target))
+		if err != nil {
+			t.Fatalf("expected meta file to exist: %v", err)
+		}
+		var raw struct {
+			VolumeContext map[string]interface{} `json:"volumeContext"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatalf("failed to parse meta: %v", err)
+		}
+		if _, ok := raw.VolumeContext["mountTargetIp"]; ok {
+			t.Error("volumeContext.mountTargetIp should be omitted when no IP was resolved")
+		}
+	})
+
+	t.Run("publish with trailing slash writes metadata outside the mount target", func(t *testing.T) {
+		t.Setenv("CSI_NODE_MEMORY_LIMIT", strconv.Itoa(minMemoryInBytesToEnableS3ReadCache*2))
+		target := filepath.Join(t.TempDir(), "mount") + string(os.PathSeparator)
+		if err := os.MkdirAll(filepath.Clean(target), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		mockMounter := mocks.NewMockMounter(gomock.NewController(t))
+		mockMounter.EXPECT().MakeDir(target).Return(nil)
+		mockMounter.EXPECT().Mount(gomock.Any(), target, gomock.Any(), gomock.Any()).Return(nil)
+
+		driver := newDriver(t, mockMounter)
+		publish(t, driver, publishReq(target))
+
+		readMeta(t, driver, target)
+
+		entries, err := os.ReadDir(filepath.Clean(target))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("mount target should be empty, found %d entries", len(entries))
+		}
+	})
+
+	for _, tc := range []struct {
+		name     string
+		refCount int
+		seedMeta bool
+	}{
+		{name: "unpublish removes meta file", refCount: 1, seedMeta: true},
+		{name: "unpublish tolerates missing meta file", refCount: 1},
+		{name: "unpublish removes metadata when target is already unmounted", seedMeta: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "mount")
+			mockMounter := mocks.NewMockMounter(gomock.NewController(t))
+			mockMounter.EXPECT().GetDeviceName(target).Return("", tc.refCount, nil)
+			if tc.refCount > 0 {
+				mockMounter.EXPECT().Unmount(target).Return(nil)
+			}
+
+			driver := newDriver(t, mockMounter)
+			metaPath := driver.efsMetaPath(target)
+			if tc.seedMeta {
+				seedMeta(t, driver, target)
+			}
+
+			req := &csi.NodeUnpublishVolumeRequest{VolumeId: volumeId, TargetPath: target}
+			if _, err := driver.NodeUnpublishVolume(context.Background(), req); err != nil {
+				t.Fatalf("NodeUnpublishVolume failed: %v", err)
+			}
+			if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
+				t.Errorf("expected meta file to be absent after unpublish, got err=%v", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name   string
+		nodeAZ string
+		ipMap  string
+		wantIP string
+	}{
+		{
+			name:   "publish with mounttargetipmap writes resolved IP for node AZ",
+			nodeAZ: "us-west-2b",
+			ipMap:  `{"us-west-2a":"10.0.1.1","us-west-2b":"10.0.2.1"}`,
+			wantIP: "10.0.2.1",
+		},
+		{
+			name:   "publish with mounttargetipmap falls back to any IP when node AZ absent",
+			nodeAZ: "us-west-2c",
+			ipMap:  `{"us-west-2a":"10.0.1.1"}`,
+			wantIP: "10.0.1.1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driver, ctrl, target := setupPublish(t)
+			mockCloud := mocks.NewMockCloud(ctrl)
+			mockCloud.EXPECT().GetMetadata().Return(&mockMetadata{availabilityZone: tc.nodeAZ}).AnyTimes()
+			driver.cloud = mockCloud
+
+			req := publishReq(target)
+			req.VolumeContext = map[string]string{"mounttargetipmap": tc.ipMap}
+			publish(t, driver, req)
+
+			if got := readMeta(t, driver, target).VolumeContext.MountTargetIP; got != tc.wantIP {
+				t.Errorf("volumeContext.mountTargetIp = %q, want %q", got, tc.wantIP)
+			}
+		})
+	}
+
+	t.Run("publish with crossaccount writes crossAccount field", func(t *testing.T) {
+		driver, _, target := setupPublish(t)
+
+		req := publishReq(target)
+		req.VolumeContext = map[string]string{"crossaccount": "true"}
+		publish(t, driver, req)
+
+		if meta := readMeta(t, driver, target); !meta.VolumeContext.CrossAccount {
+			t.Error("volumeContext.crossAccount = false, want true")
+		}
+	})
+
+	for _, tc := range []struct {
+		name       string
+		volumeID   string
+		mountFlags []string
+		wantFsType string
+		wantIAM    bool
+	}{
+		{
+			name:       "publish with explicit iam records iam=true",
+			volumeID:   volumeId,
+			mountFlags: []string{"iam"},
+			wantFsType: "efs",
+			wantIAM:    true,
+		},
+		{
+			name:       "publish with S3 Files implies iam=true",
+			volumeID:   "s3files:fs-abcd1234::fsap-abcd1234",
+			wantFsType: "s3files",
+			wantIAM:    true,
+		},
+		{
+			name:       "publish with access point but no iam option records iam=false",
+			volumeID:   volumeId + "::fsap-deadbeef",
+			wantFsType: "efs",
+		},
+		{
+			name:       "publish plain EFS records iam=false",
+			volumeID:   volumeId,
+			wantFsType: "efs",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driver, _, target := setupPublish(t)
+			req := publishReq(target)
+			req.VolumeId = tc.volumeID
+			if tc.mountFlags != nil {
+				req.VolumeCapability = &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{MountFlags: tc.mountFlags},
+					},
+					AccessMode: stdVolCap.AccessMode,
+				}
+			}
+			publish(t, driver, req)
+
+			meta := readMeta(t, driver, target)
+			if meta.FsType != tc.wantFsType {
+				t.Errorf("fsType = %q, want %q", meta.FsType, tc.wantFsType)
+			}
+			if meta.Iam != tc.wantIAM {
+				t.Errorf("iam = %t, want %t", meta.Iam, tc.wantIAM)
+			}
+			if tc.wantIAM && len(tc.mountFlags) > 0 && !hasOption(meta.MountFlags, "iam") {
+				t.Errorf("mountFlags missing iam: %v", meta.MountFlags)
+			}
+		})
+	}
+
+	t.Run("publish does not write meta file when mount fails", func(t *testing.T) {
+		t.Setenv("CSI_NODE_MEMORY_LIMIT", strconv.Itoa(minMemoryInBytesToEnableS3ReadCache*2))
+		target := filepath.Join(t.TempDir(), "mount")
+
+		mockMounter := mocks.NewMockMounter(gomock.NewController(t))
+		mockMounter.EXPECT().MakeDir(gomock.Eq(target)).Return(nil)
+		mockMounter.EXPECT().Mount(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("mount boom"))
+
+		driver := newDriver(t, mockMounter)
+		if _, err := driver.NodePublishVolume(context.Background(), publishReq(target)); err == nil {
+			t.Fatal("NodePublishVolume: expected error on mount failure")
+		}
+
+		if _, err := os.Stat(driver.efsMetaPath(target)); !os.IsNotExist(err) {
+			t.Errorf("meta file should not exist after mount failure, got err=%v", err)
+		}
+	})
+
+	t.Run("publish succeeds when meta write fails", func(t *testing.T) {
+		t.Setenv("CSI_NODE_MEMORY_LIMIT", strconv.Itoa(minMemoryInBytesToEnableS3ReadCache*2))
+		target := filepath.Join(t.TempDir(), "mount")
+
+		mockMounter := mocks.NewMockMounter(gomock.NewController(t))
+		mockMounter.EXPECT().MakeDir(gomock.Eq(target)).Return(nil)
+		mockMounter.EXPECT().Mount(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+		driver := newDriver(t, mockMounter)
+		// Put a regular file where MkdirAll expects a parent directory. This
+		// makes MkdirAll fail with ENOTDIR for any UID (including root),
+		// which is portable across CI environments.
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		if err := os.WriteFile(blocker, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		driver.metaDir = filepath.Join(blocker, "mounts")
+
+		if _, err := driver.NodePublishVolume(context.Background(), publishReq(target)); err != nil {
+			t.Fatalf("NodePublishVolume should succeed on meta-write failure: %v", err)
+		}
+		// Any stat error is fine here — the meta file must not have been
+		// written. ENOENT is expected on non-root; ENOTDIR is what we get
+		// via the blocker-file mechanism.
+		if _, err := os.Stat(driver.efsMetaPath(target)); err == nil {
+			t.Error("meta file should not exist after meta-write failure")
+		}
+	})
+
+	t.Run("meta path is stable under filepath.Clean", func(t *testing.T) {
+		driver := newDriver(t, nil)
+		a := driver.efsMetaPath("/var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/pv/mount")
+		b := driver.efsMetaPath("/var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/pv/mount/")
+		c := driver.efsMetaPath("/var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi//pv/mount")
+		if a != b || a != c {
+			t.Errorf("efsMetaPath should be stable under trailing slashes and duplicate separators:\n  a=%s\n  b=%s\n  c=%s", a, b, c)
+		}
+	})
 }
