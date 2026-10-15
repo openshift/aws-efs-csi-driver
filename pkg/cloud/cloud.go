@@ -201,12 +201,18 @@ func createEfsClient(awsRoleArn string, externalId string, metadata MetadataServ
 		}
 		cfg.Credentials = aws.NewCredentialsCache(roleProvider)
 	}
-	return efs.NewFromConfig(cfg)
+	efsOptions := func(o *efs.Options) {
+		o.APIOptions = append(o.APIOptions, RecordRequestsMiddleware("efs"), LogServerErrorsMiddleware())
+	}
+	return efs.NewFromConfig(cfg, efsOptions)
 }
 
 func createS3FilesClient(metadata MetadataService) S3Files {
 	cfg, _ := config.LoadDefaultConfig(context.TODO(), config.WithRegion(metadata.GetRegion()))
-	return s3files.NewFromConfig(cfg)
+	s3Options := func(o *s3files.Options) {
+		o.APIOptions = append(o.APIOptions, RecordRequestsMiddleware("s3files"), LogServerErrorsMiddleware())
+	}
+	return s3files.NewFromConfig(cfg, s3Options)
 }
 
 // validateFIPSRegion checks if FIPS endpoints are requested in a non-US/Canada region
@@ -380,6 +386,12 @@ func (c *cloud) DescribeAccessPoint(ctx context.Context, accessPointId string, f
 		accessPoints := res.AccessPoints
 		if len(accessPoints) == 0 || len(accessPoints) > 1 {
 			return nil, fmt.Errorf("DescribeAccessPoint failed. Expected exactly 1 access point in DescribeAccessPoint result. However, received %d access points", len(accessPoints))
+		}
+
+		// Verify the access point belongs to the expected filesystem.
+		if *accessPoints[0].FileSystemId != fileSystemId {
+			return nil, fmt.Errorf("access point %s does not belong to filesystem %s",
+				accessPointId, fileSystemId)
 		}
 
 		return &AccessPoint{

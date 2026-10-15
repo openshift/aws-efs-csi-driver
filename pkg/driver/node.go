@@ -18,14 +18,18 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -34,6 +38,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
@@ -44,9 +49,29 @@ var (
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 		csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 	}
-	volumeIdCounter  = make(map[string]int)
-	supportedFSTypes = []string{util.FileSystemTypeEFS.String(), util.FileSystemTypeS3Files.String(), ""}
-	hexSuffixRegex   = regexp.MustCompile(`^[0-9a-f]{8,40}$`)
+	volumeIdCounter = make(map[string]int)
+	// volumeIdCounterMu guards concurrent access to volumeIdCounter, which is
+	// read/written/deleted from NodePublishVolume and NodeUnpublishVolume.
+	// Those handlers run concurrently as independent goroutines per gRPC
+	// call, so the map must be protected against concurrent access.
+	volumeIdCounterMu sync.Mutex
+	supportedFSTypes  = []string{util.FileSystemTypeEFS.String(), util.FileSystemTypeS3Files.String(), ""}
+	hexSuffixRegex    = regexp.MustCompile(`^[0-9a-f]{8,40}$`)
+	// dnsFileSystemIdRegex matches the DNS-name form of a file system ID used in
+	// static PV volumeHandles. It validates the structure of the name rather than
+	// enumerating known domains, covering:
+	//   EFS bare:        fs-9919e11b.efs.us-east-1.amazonaws.com
+	//   EFS AZ-prefixed: us-east-1a.fs-9919e11b.efs.us-east-1.amazonaws.com
+	//   S3 Files:        use1-az1.fs-0123456abcdef0189.s3files.us-east-1.on.aws
+	// An optional single leading AZ label may precede the strictly-validated
+	// fs-[0-9a-f]{8,40} id label. The surrounding DNS labels are matched
+	// case-insensitively (DNS names are case-insensitive), but the fs-<hex> id
+	// label itself is kept strictly lowercase hex so that the DNS branch does not
+	// accept ids (e.g. fs-ABCDEF12) that the bare-id branch would reject. The
+	// remaining domain is constrained to the DNS charset ([a-zA-Z0-9.-]) only (no
+	// commas, spaces, slashes, or '='), so a DNS-name volumeHandle cannot be used
+	// to inject additional mount options into the mount source passed to efs-utils.
+	dnsFileSystemIdRegex = regexp.MustCompile(`^([a-zA-Z0-9][a-zA-Z0-9-]*\.)?fs-[0-9a-f]{8,40}\.[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$`)
 )
 
 const (
@@ -54,6 +79,29 @@ const (
 	GiB                                 = 1024 * 1024 * 1024
 	minMemoryInBytesToEnableS3ReadCache = 30 * GiB
 )
+
+type efsVolumeMeta struct {
+	SchemaVersion int                  `json:"schemaVersion"`
+	Target        string               `json:"target"`
+	FsType        string               `json:"fsType"`
+	VolumeHandle  efsVolumeHandleMeta  `json:"volumeHandle"`
+	VolumeContext efsVolumeContextMeta `json:"volumeContext"`
+	MountFlags    []string             `json:"mountFlags"`
+	ReadOnly      bool                 `json:"readOnly"`
+	Iam           bool                 `json:"iam"`
+}
+
+type efsVolumeHandleMeta struct {
+	FileSystemID  string `json:"fileSystemId"`
+	ExportPath    string `json:"exportPath"`
+	AccessPointID string `json:"accessPointId,omitempty"`
+}
+
+type efsVolumeContextMeta struct {
+	EncryptInTransit bool   `json:"encryptInTransit"`
+	MountTargetIP    string `json:"mountTargetIp,omitempty"`
+	CrossAccount     bool   `json:"crossAccount"`
+}
 
 func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
@@ -101,6 +149,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	subpath := "/"
 	encryptInTransit := true
 	crossAccountDNSEnabled := false
+	resolvedMountTargetIP := ""
 	volContext := req.GetVolumeContext()
 	for k, v := range volContext {
 		switch strings.ToLower(k) {
@@ -113,9 +162,10 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Volume context property %q must be a boolean value: %v", k, err))
 			}
 		case MountTargetIp:
-			if net.ParseIP(v) == nil {
+			if !isValidMountTargetIP(v) {
 				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Volume context property %q=%q is not a valid IP address", k, v))
 			}
+			resolvedMountTargetIP = v
 			mountOptions = append(mountOptions, MountTargetIp+"="+v)
 		case MountTargetIpMap:
 			// Parse the AZ→IP map passed from the controller and select the mount target
@@ -125,13 +175,23 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			if err := json.Unmarshal([]byte(v), &ipMap); err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, "Failed to parse %s: %v", MountTargetIpMap, err)
 			}
+			// Validate every entry before selecting one, so the same map is accepted
+			// or rejected identically on every node regardless of which AZ each one
+			// resolves to.
+			for az, ip := range ipMap {
+				if !isValidMountTargetIP(ip) {
+					return nil, status.Errorf(codes.InvalidArgument, "Volume context property %q has an invalid IP address %q for availability zone %q", k, ip, az)
+				}
+			}
 			nodeAZ := d.cloud.GetMetadata().GetAvailabilityZone()
 			if ip, ok := ipMap[nodeAZ]; ok {
+				resolvedMountTargetIP = ip
 				mountOptions = append(mountOptions, MountTargetIp+"="+ip)
 			} else {
 				// No mount target in this node's AZ; pick any available one as fallback.
 				for az, ip := range ipMap {
 					klog.Warningf("No mount target IP for node AZ %s, falling back to AZ %s (IP %s)", nodeAZ, az, ip)
+					resolvedMountTargetIP = ip
 					mountOptions = append(mountOptions, MountTargetIp+"="+ip)
 					break
 				}
@@ -265,13 +325,35 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	}
 	klog.V(5).Infof("NodePublishVolume: %s was mounted", target)
 
+	d.writeEfsMeta(target, efsVolumeMeta{
+		SchemaVersion: 1,
+		Target:        target,
+		FsType:        fsType.String(),
+		VolumeHandle: efsVolumeHandleMeta{
+			FileSystemID:  fsid,
+			ExportPath:    subpath,
+			AccessPointID: apid,
+		},
+		VolumeContext: efsVolumeContextMeta{
+			EncryptInTransit: encryptInTransit,
+			MountTargetIP:    resolvedMountTargetIP,
+			CrossAccount:     crossAccountDNSEnabled,
+		},
+		MountFlags: mountOptions,
+		ReadOnly:   req.GetReadonly(),
+		Iam: hasOption(mountOptions, "iam") ||
+			fsType == util.FileSystemTypeS3Files,
+	})
+
 	//Increment volume Id counter
 	if d.volMetricsOptIn {
+		volumeIdCounterMu.Lock()
 		if value, ok := volumeIdCounter[req.GetVolumeId()]; ok {
 			volumeIdCounter[req.GetVolumeId()] = value + 1
 		} else {
 			volumeIdCounter[req.GetVolumeId()] = 1
 		}
+		volumeIdCounterMu.Unlock()
 	}
 
 	return &csi.NodePublishVolumeResponse{}, nil
@@ -306,6 +388,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 		// reply 0 OK.
 		if refCount == 0 {
 			klog.V(5).Infof("NodeUnpublishVolume: %s target not mounted", target)
+			d.removeEfsMeta(target)
 			return &csi.NodeUnpublishVolumeResponse{}, nil
 		}
 
@@ -318,9 +401,12 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 
 	klog.V(5).Infof("NodeUnpublishVolume: %s unmounted", target)
 
+	d.removeEfsMeta(target)
+
 	//TODO: If `du` is running on a volume, unmount waits for it to complete. We should stop `du` on unmount in the future for NodeUnpublish
 	//Decrement Volume ID counter and evict cache if counter is 0.
 	if d.volMetricsOptIn {
+		volumeIdCounterMu.Lock()
 		if value, ok := volumeIdCounter[req.GetVolumeId()]; ok {
 			value -= 1
 			if value < 1 {
@@ -331,6 +417,7 @@ func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublish
 				volumeIdCounter[req.GetVolumeId()] = value
 			}
 		}
+		volumeIdCounterMu.Unlock()
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -499,7 +586,9 @@ func (d *Driver) validateFStype(volCaps []*csi.VolumeCapability) error {
 //   - Examples: `fs-abcd1234::`, `fs-abcd1234:`, `fs-abcd1234`, `fs-abcd1234:/path:fsap-xyz123`
 //
 // COMMON RULES:
-//   - The `{fileSystemID}` is required, and expected to be of the form `fs-...`
+//   - The `{fileSystemID}` is required. It may be either the bare id `fs-[0-9a-f]{8,40}`,
+//     or the mount-target DNS name form (e.g. `fs-abcd1234.efs.<region>.amazonaws.com`,
+//     optionally with a leading AZ label such as `us-east-1a.fs-abcd1234.efs.<region>.amazonaws.com`)
 //   - The `{mountPath}` and `{accessPointID}` are optional -- they may be empty or omitted entirely
 //   - The `{mountPath}`, if specified, is not required to be absolute
 //   - The `{accessPointID}` is expected to be of the form `fsap-...`
@@ -531,7 +620,7 @@ func parseVolumeId(volumeId string) (fsid, subpath, apid string, fsType util.Fil
 		// Validate and extract fsid
 		fsid = tokens[1]
 		if !isValidFileSystemId(fsid) {
-			err = status.Errorf(codes.InvalidArgument, "volume ID '%s' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}'", volumeId)
+			err = status.Errorf(codes.InvalidArgument, "volume ID '%s' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}' or a mount-target DNS name (e.g. 'fs-abcd1234.efs.<region>.amazonaws.com')", volumeId)
 			return
 		}
 
@@ -559,7 +648,7 @@ func parseVolumeId(volumeId string) (fsid, subpath, apid string, fsType util.Fil
 		// Extract fsid
 		fsid = tokens[0]
 		if !isValidFileSystemId(fsid) {
-			err = status.Errorf(codes.InvalidArgument, "volume ID '%s' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}'", volumeId)
+			err = status.Errorf(codes.InvalidArgument, "volume ID '%s' is invalid: Expected a file system ID of the form 'fs-[0-9a-f]{8,40}' or a mount-target DNS name (e.g. 'fs-abcd1234.efs.<region>.amazonaws.com')", volumeId)
 			return
 		}
 
@@ -581,6 +670,18 @@ func parseVolumeId(volumeId string) (fsid, subpath, apid string, fsType util.Fil
 	return
 }
 
+// buildVolumeId renders the volume handle returned by CreateVolume, and is the
+// inverse of parseVolumeId. EFS keeps the legacy un-prefixed form because
+// handles are also read by mounters outside this driver that predate the typed
+// format. parseVolumeId reads an un-prefixed handle as EFS, so nothing in this
+// driver depends on the prefix being present.
+func buildVolumeId(fsType util.FileSystemType, fileSystemId, accessPointId string) string {
+	if fsType == util.FileSystemTypeEFS {
+		return fileSystemId + "::" + accessPointId
+	}
+	return fsType.String() + ":" + fileSystemId + "::" + accessPointId
+}
+
 // Check and avoid adding duplicate mount options
 func hasOption(options []string, opt string) bool {
 	for _, o := range options {
@@ -591,12 +692,66 @@ func hasOption(options []string, opt string) bool {
 	return false
 }
 
+// efsMetaPath hashes the cleaned target so consumers can derive it from mountinfo.
+func (d *Driver) efsMetaPath(target string) string {
+	sum := sha256.Sum256([]byte(filepath.Clean(target)))
+	return filepath.Join(d.metaDir, hex.EncodeToString(sum[:])+".json")
+}
+
+func (d *Driver) removeEfsMeta(target string) {
+	metaPath := d.efsMetaPath(target)
+	if err := os.Remove(metaPath); err != nil && !os.IsNotExist(err) {
+		klog.Warningf("NodeUnpublishVolume: remove %s: %v", metaPath, err)
+	}
+}
+
+// writeEfsMeta writes metadata atomically without failing a successful mount.
+func (d *Driver) writeEfsMeta(target string, meta efsVolumeMeta) {
+	metaPath := d.efsMetaPath(target)
+	tmpPath := metaPath + ".tmp"
+
+	if err := os.MkdirAll(d.metaDir, 0700); err != nil {
+		klog.Warningf("NodePublishVolume: mkdir %s: %v", d.metaDir, err)
+		return
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		klog.Warningf("NodePublishVolume: marshal %s: %v", metaPath, err)
+		return
+	}
+	if err := os.WriteFile(tmpPath, b, 0600); err != nil {
+		klog.Warningf("NodePublishVolume: write %s: %v", tmpPath, err)
+		return
+	}
+	if err := os.Rename(tmpPath, metaPath); err != nil {
+		klog.Warningf("NodePublishVolume: rename %s: %v", metaPath, err)
+		_ = os.Remove(tmpPath)
+	}
+}
+
 func isValidFileSystemId(filesystemId string) bool {
-	return strings.HasPrefix(filesystemId, "fs-") && hexSuffixRegex.MatchString(filesystemId[3:])
+	// Accept either the bare id (fs-[0-9a-f]{8,40}) or the DNS-name form used in
+	// static PV volumeHandles (EFS bare/AZ-prefixed and S3 Files). The DNS-name
+	// form is passed through unchanged to efs-utils. Both forms keep the fs-<hex>
+	// id portion strictly validated and constrain the DNS charset to prevent
+	// mount-option injection.
+	if strings.HasPrefix(filesystemId, "fs-") && hexSuffixRegex.MatchString(filesystemId[3:]) {
+		return true
+	}
+	return dnsFileSystemIdRegex.MatchString(filesystemId)
 }
 
 func isValidAccessPointId(accesspointId string) bool {
 	return strings.HasPrefix(accesspointId, "fsap-") && hexSuffixRegex.MatchString(accesspointId[5:])
+}
+
+// isValidMountTargetIP reports whether value is a bare IPv4 or IPv6 address.
+// Mount target IPs are concatenated into the comma-separated list passed to
+// mount(8) as -o, so a value carrying a separator would be read as additional
+// mount options. This constrains the shape of the address only; it does not
+// check that the address belongs to a mount target of the file system.
+func isValidMountTargetIP(value string) bool {
+	return net.ParseIP(value) != nil
 }
 
 // Struct for JSON patch operations
@@ -608,6 +763,37 @@ type JSONPatch struct {
 
 // removeNotReadyTaint removes the taint efs.csi.aws.com/agent-not-ready from the local node
 // This taint can be optionally applied by users to prevent startup race conditions such as
+// checkDriverRegistration verifies that the driver is registered in the CSINode object
+// by checking that the CSINode exists and lists our driver name in Spec.Drivers.
+// Returns nil when registered, error otherwise.
+func checkDriverRegistration(k8sClient cloud.KubernetesAPIClient, driverName string) error {
+	nodeName := os.Getenv("CSI_NODE_NAME")
+	if nodeName == "" {
+		return fmt.Errorf("CSI_NODE_NAME not set")
+	}
+	clientset, err := k8sClient()
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+	csiNode, err := clientset.StorageV1().CSINodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+			klog.Warningf("Cannot check CSINode registration due to insufficient RBAC permissions (need 'get' on 'csinodes.storage.k8s.io'). "+
+				"The startup taint %s will NOT be removed until permissions are granted. "+
+				"Please update the driver's ClusterRole to include this permission.", AgentNotReadyNodeTaintKey)
+		}
+		return fmt.Errorf("failed to get CSINode: %w", err)
+	}
+	for _, driver := range csiNode.Spec.Drivers {
+		if driver.Name == driverName {
+			// Driver is registered with kubelet. Allocatable is intentionally
+			// not required here (EFS has no volume attach limit).
+			return nil
+		}
+	}
+	return fmt.Errorf("driver %s not yet listed in CSINode", driverName)
+}
+
 // https://github.com/kubernetes/kubernetes/issues/95911
 func removeNotReadyTaint(k8sClient cloud.KubernetesAPIClient) error {
 	if os.Getenv("DISABLE_TAINT_WATCHER") != "" {
@@ -682,15 +868,27 @@ func removeNotReadyTaint(k8sClient cloud.KubernetesAPIClient) error {
 }
 
 // remove taint may fail, this keeps retrying until it succeeds, make sure the taint will eventually be removed
-func tryRemoveNotReadyTaintUntilSucceed(interval time.Duration, removeFn func() error) {
+func tryRemoveNotReadyTaintUntilSucceed(initialDelay time.Duration, interval time.Duration, maxInterval time.Duration, registrationCheckFn func() error, removeFn func() error) {
+	time.Sleep(initialDelay)
+	currentInterval := interval
 	for {
+		if err := registrationCheckFn(); err != nil {
+			klog.V(4).InfoS("Waiting for driver registration before removing taint", "reason", err)
+			time.Sleep(currentInterval)
+			if currentInterval < maxInterval {
+				currentInterval = currentInterval * 2
+				if currentInterval > maxInterval {
+					currentInterval = maxInterval
+				}
+			}
+			continue
+		}
 		err := removeFn()
 		if err == nil {
 			return
 		}
-
 		klog.ErrorS(err, "Unexpected failure when attempting to remove node taint(s)")
-		time.Sleep(interval)
+		time.Sleep(currentInterval)
 	}
 }
 
