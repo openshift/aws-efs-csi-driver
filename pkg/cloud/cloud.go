@@ -102,7 +102,7 @@ type Cloud interface {
 	GetMetadata() MetadataService
 	CreateAccessPoint(ctx context.Context, clientToken string, accessPointOpts *AccessPointOptions) (accessPoint *AccessPoint, err error)
 	DeleteAccessPoint(ctx context.Context, accessPointId string) (err error)
-	DescribeAccessPoint(ctx context.Context, accessPointId string) (accessPoint *AccessPoint, err error)
+	DescribeAccessPoint(ctx context.Context, accessPointId string, fileSystemId string) (accessPoint *AccessPoint, err error)
 	FindAccessPointByClientToken(ctx context.Context, clientToken, fileSystemId string) (accessPoint *AccessPoint, err error)
 	ListAccessPoints(ctx context.Context, fileSystemId string) (accessPoints []*AccessPoint, err error)
 	DescribeFileSystem(ctx context.Context, fileSystemId string) (fs *FileSystem, err error)
@@ -233,7 +233,7 @@ func (c *cloud) DeleteAccessPoint(ctx context.Context, accessPointId string) (er
 	return nil
 }
 
-func (c *cloud) DescribeAccessPoint(ctx context.Context, accessPointId string) (accessPoint *AccessPoint, err error) {
+func (c *cloud) DescribeAccessPoint(ctx context.Context, accessPointId string, fileSystemId string) (accessPoint *AccessPoint, err error) {
 	describeAPInput := &efs.DescribeAccessPointsInput{
 		AccessPointId: &accessPointId,
 	}
@@ -253,6 +253,11 @@ func (c *cloud) DescribeAccessPoint(ctx context.Context, accessPointId string) (
 	accessPoints := res.AccessPoints
 	if len(accessPoints) == 0 || len(accessPoints) > 1 {
 		return nil, fmt.Errorf("DescribeAccessPoint failed. Expected exactly 1 access point in DescribeAccessPoint result. However, recevied %d access points", len(accessPoints))
+	}
+
+	if *accessPoints[0].FileSystemId != fileSystemId {
+		return nil, fmt.Errorf("access point %s does not belong to filesystem %s",
+			accessPointId, fileSystemId)
 	}
 
 	return &AccessPoint{
