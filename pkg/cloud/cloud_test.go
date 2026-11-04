@@ -345,7 +345,7 @@ func TestDescribeAccessPoint(t *testing.T) {
 				}
 				ctx := context.Background()
 				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(output, nil)
-				res, err := c.DescribeAccessPoint(ctx, accessPointId)
+				res, err := c.DescribeAccessPoint(ctx, accessPointId, fsId)
 				if err != nil {
 					t.Fatalf("Describe Access Point failed: %v", err)
 				}
@@ -393,7 +393,7 @@ func TestDescribeAccessPoint(t *testing.T) {
 				}
 				ctx := context.Background()
 				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(output, nil)
-				res, err := c.DescribeAccessPoint(ctx, accessPointId)
+				res, err := c.DescribeAccessPoint(ctx, accessPointId, fsId)
 				if err != nil {
 					t.Fatalf("Describe Access Point failed: %v", err)
 				}
@@ -425,7 +425,7 @@ func TestDescribeAccessPoint(t *testing.T) {
 				}
 				ctx := context.Background()
 				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(output, nil)
-				_, err := c.DescribeAccessPoint(ctx, accessPointId)
+				_, err := c.DescribeAccessPoint(ctx, accessPointId, fsId)
 				if err == nil {
 					t.Fatalf("DescribeAccessPoint did not fail")
 				}
@@ -484,7 +484,7 @@ func TestDescribeAccessPoint(t *testing.T) {
 				}
 				ctx := context.Background()
 				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(output, nil)
-				_, err := c.DescribeAccessPoint(ctx, accessPointId)
+				_, err := c.DescribeAccessPoint(ctx, accessPointId, fsId)
 				if err == nil {
 					t.Fatalf("DescribeAccessPoint did not fail")
 				}
@@ -500,7 +500,7 @@ func TestDescribeAccessPoint(t *testing.T) {
 
 				ctx := context.Background()
 				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(nil, awserr.New(efs.ErrCodeAccessPointNotFound, "Access Point not found", errors.New("DeleteAccessPointWithContext failed")))
-				_, err := c.DescribeAccessPoint(ctx, accessPointId)
+				_, err := c.DescribeAccessPoint(ctx, accessPointId, fsId)
 				if err == nil {
 					t.Fatalf("DescribeAccessPoint did not fail")
 				}
@@ -519,7 +519,7 @@ func TestDescribeAccessPoint(t *testing.T) {
 
 				ctx := context.Background()
 				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(nil, awserr.New(AccessDeniedException, "Access Denied", errors.New("Access Denied")))
-				_, err := c.DescribeAccessPoint(ctx, accessPointId)
+				_, err := c.DescribeAccessPoint(ctx, accessPointId, fsId)
 				if err == nil {
 					t.Fatalf("DescribeAccessPoint did not fail")
 				}
@@ -538,9 +538,54 @@ func TestDescribeAccessPoint(t *testing.T) {
 
 				ctx := context.Background()
 				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(nil, errors.New("DescribeAccessPointWithContext failed"))
-				_, err := c.DescribeAccessPoint(ctx, accessPointId)
+				_, err := c.DescribeAccessPoint(ctx, accessPointId, fsId)
 				if err == nil {
 					t.Fatalf("DescribeAccessPoint did not fail")
+				}
+				mockctl.Finish()
+			},
+		},
+		{
+			name: "Fail: Access point belongs to different filesystem",
+			testFunc: func(t *testing.T) {
+				mockctl := gomock.NewController(t)
+				mockEfs := mocks.NewMockEfs(mockctl)
+				c := &cloud{efs: mockEfs}
+
+				differentFsId := "fs-differentfs"
+				output := &efs.DescribeAccessPointsOutput{
+					AccessPoints: []*efs.AccessPointDescription{
+						{
+							AccessPointArn: aws.String(arn),
+							AccessPointId:  aws.String(accessPointId),
+							ClientToken:    aws.String("test"),
+							FileSystemId:   aws.String(fsId),
+							OwnerId:        aws.String("1234567890"),
+							PosixUser: &efs.PosixUser{
+								Gid: aws.Int64(gid),
+								Uid: aws.Int64(uid),
+							},
+							RootDirectory: &efs.RootDirectory{
+								CreationInfo: &efs.CreationInfo{
+									OwnerGid:    aws.Int64(gid),
+									OwnerUid:    aws.Int64(uid),
+									Permissions: aws.String(directoryPerms),
+								},
+								Path: aws.String(directoryPath),
+							},
+						},
+					},
+					NextToken: nil,
+				}
+				ctx := context.Background()
+				mockEfs.EXPECT().DescribeAccessPointsWithContext(gomock.Eq(ctx), gomock.Any()).Return(output, nil)
+				_, err := c.DescribeAccessPoint(ctx, accessPointId, differentFsId)
+				if err == nil {
+					t.Fatalf("DescribeAccessPoint should have failed when access point belongs to a different filesystem")
+				}
+				expectedErrMsg := "access point fsap-abcd1234xyz987 does not belong to filesystem fs-differentfs"
+				if err.Error() != expectedErrMsg {
+					t.Fatalf("Unexpected error message. Expected: %v, Actual: %v", expectedErrMsg, err.Error())
 				}
 				mockctl.Finish()
 			},
