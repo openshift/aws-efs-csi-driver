@@ -28,6 +28,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/driver/mocks"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const (
@@ -858,6 +859,13 @@ func TestNodeGetVolumeStats(t *testing.T) {
 			testResult(t, "NodeGetVolumeStats", ret, err, tc.expectError)
 			if tc.expectedResponse != nil {
 				testResponse(t, tc.expectedResponse, ret)
+			}
+			if err := wait.PollImmediate(time.Millisecond, time.Second, func() (bool, error) {
+				mu.RLock()
+				defer mu.RUnlock()
+				return !volStatterJobTracker[volumeId], nil
+			}); err != nil {
+				t.Fatalf("volume stats worker did not finish: %v", err)
 			}
 			mu.Lock()
 			delete(volUsageCache, volumeId)
